@@ -130,7 +130,7 @@ class SparseVector(BaseModel):
 class SparseEmbeddingResponse(BaseModel):
     vectors: list[SparseVector]
 
-
+#привет
 DENSE_PREFETCH_K = 10
 SPARSE_PREFETCH_K = 30
 RETRIEVE_K = 20
