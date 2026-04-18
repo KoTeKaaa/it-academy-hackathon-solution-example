@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from qdrant_client import AsyncQdrantClient, models, Filter
+from qdrant_client import AsyncQdrantClient, models
 
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
