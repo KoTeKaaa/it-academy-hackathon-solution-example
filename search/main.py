@@ -1,7 +1,6 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -15,7 +14,6 @@ from qdrant_client import AsyncQdrantClient, models
 
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
-# Ваш сервис должен считывать эти переменные из окружения (env), так как проверяющая система управляет ими
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8003"))
 
@@ -74,7 +72,8 @@ def get_upstream_request_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-# Модель данных, которую мы предоставляем и рассчитываем получать от вас
+# ── Модели данных ────────────────────────────────────────────────────────────
+
 class DateRange(BaseModel):
     from_: str = Field(alias="from")
     to: str
@@ -127,14 +126,9 @@ class SparseVector(BaseModel):
     values: list[float] = Field(default_factory=list)
 
 
-class SparseEmbeddingResponse(BaseModel):
-    vectors: list[SparseVector]
-
-
-# Метадата чанков в Qdrant'e, по которой вы можете фильтровать
 class ChunkMetadata(BaseModel):
     chat_name: str
-    chat_type: str  # channel, group, private, thread
+    chat_type: str
     chat_id: str
     chat_sn: str
     thread_sn: str | None = None
@@ -156,10 +150,7 @@ def get_sparse_model() -> SparseTextEmbedding:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient()
-    app.state.qdrant = AsyncQdrantClient(
-        url=QDRANT_URL,
-        api_key=API_KEY,
-    )
+    app.state.qdrant = AsyncQdrantClient(url=QDRANT_URL, api_key=API_KEY)
     try:
         yield
     finally:
@@ -167,13 +158,15 @@ async def lifespan(app: FastAPI):
         await app.state.qdrant.close()
 
 
-app = FastAPI(title="Search Service", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Search Service", version="0.4.0", lifespan=lifespan)
 
 # ── Параметры retrieval ──────────────────────────────────────────────────────
-DENSE_PREFETCH_K = 15
-SPARSE_PREFETCH_K = 40
-RETRIEVE_K = 30
-RERANK_LIMIT = 10
+# Recall@50 — главная метрика (80% веса).
+# Широкая воронка = больше шансов поймать нужные чанки до реранка.
+DENSE_PREFETCH_K = 20      # было 15
+SPARSE_PREFETCH_K = 50     # было 40
+RETRIEVE_K = 40            # было 30; итоговый пул после RRF
+RERANK_LIMIT = 15          # было 10; больше кандидатов → лучше nDCG
 
 # Жёсткий лимит символов для dense-запроса (один вызов на вопрос)
 DENSE_QUERY_MAX_CHARS = 512
@@ -183,15 +176,14 @@ DENSE_QUERY_MAX_CHARS = 512
 
 def build_dense_query(question: Question) -> str:
     """
-    Строим ОДИН компактный текст для dense embedding.
-
-    Правило: ровно один HTTP-запрос к dense API на каждый вопрос.
-    HyDE и variants сюда НЕ идут — они длинные и дорогие по символам.
-    Их ценность передаётся через sparse (BM25 работает локально, бесплатно).
+    Один компактный текст для dense embedding — ровно 1 API-вызов на вопрос.
 
     Состав:
-      - search_text (если задан) или text
-      - имена людей / сущностей (критичны для семантического поиска по людям)
+      - search_text (если есть) или text — семантический смысл вопроса
+      - entity names/people — критично для «Кто руководит X?»
+
+    HyDE и variants здесь не нужны: они длинные, дорогие по символам,
+    и их ценность полностью покрывается богатым sparse-запросом.
     """
     base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
 
@@ -204,7 +196,6 @@ def build_dense_query(question: Question) -> str:
 
     combined = f"{base}\n{' '.join(entity_tokens)}" if entity_tokens else base
 
-    # Обрезаем на случай очень длинных search_text
     if len(combined) > DENSE_QUERY_MAX_CHARS:
         combined = combined[:DENSE_QUERY_MAX_CHARS]
 
@@ -214,15 +205,15 @@ def build_dense_query(question: Question) -> str:
 
 def build_sparse_query(question: Question) -> str:
     """
-    Богатый текст для sparse (BM25) — локально, rate limit не расходуется.
+    Богатый текст для BM25 — локальная модель, rate limit не расходуется.
 
-    Включаем всё:
+    Включаем всё доступное:
       - base text / search_text
-      - keywords
-      - имена/сущности
-      - варианты вопроса
+      - keywords — золото для точного лексического матча
+      - entity names, documents
+      - варианты вопроса (расширяют словарный охват)
       - первые строки HyDE-документов (суть без объёма)
-      - date_mentions
+      - date_mentions — для запросов с датами
     """
     parts: list[str] = []
 
@@ -247,7 +238,7 @@ def build_sparse_query(question: Question) -> str:
         for v in question.variants[:3]:
             parts.append(v.strip())
 
-    # Из HyDE берём только первую строку каждого документа (≤200 символов)
+    # Только первая строка HyDE — суть без длинного тела
     if question.hyde:
         for h in question.hyde[:3]:
             first_line = h.strip().split("\n")[0][:200]
@@ -262,84 +253,9 @@ def build_sparse_query(question: Question) -> str:
     return combined
 
 
-def build_qdrant_filter(question: Question) -> models.Filter | None:
-    """
-    Фильтр по метадате чанков:
-    - date_range → пересечение временных интервалов
-    - emails     → metadata.mentions содержит email
-    """
-    conditions: list[Any] = []
-
-    if question.date_range:
-        date_filter = _build_date_filter(question.date_range)
-        if date_filter:
-            conditions.append(date_filter)
-
-    if question.entities and question.entities.emails:
-        for email in question.entities.emails:
-            conditions.append(
-                models.FieldCondition(
-                    key="metadata.mentions",
-                    match=models.MatchValue(value=email),
-                )
-            )
-
-    if not conditions:
-        return None
-
-    return models.Filter(must=conditions)
-
-
-def _parse_date_to_timestamp(date_str: str) -> int | None:
-    formats = [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ]
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(date_str.strip(), fmt)
-            return int(dt.replace(tzinfo=timezone.utc).timestamp())
-        except ValueError:
-            continue
-    return None
-
-
-def _build_date_filter(date_range: DateRange) -> models.Filter | None:
-    from_ts = _parse_date_to_timestamp(date_range.from_)
-    to_ts = _parse_date_to_timestamp(date_range.to)
-
-    if from_ts is None and to_ts is None:
-        logger.warning("Could not parse date_range: from=%s to=%s", date_range.from_, date_range.to)
-        return None
-
-    sub_conditions: list[Any] = []
-    if to_ts is not None:
-        sub_conditions.append(
-            models.FieldCondition(
-                key="metadata.date_start",
-                range=models.Range(lte=to_ts),
-            )
-        )
-    if from_ts is not None:
-        sub_conditions.append(
-            models.FieldCondition(
-                key="metadata.date_end",
-                range=models.Range(gte=from_ts),
-            )
-        )
-
-    if not sub_conditions:
-        return None
-
-    return models.Filter(must=sub_conditions)
-
-
 # ── Embedding ────────────────────────────────────────────────────────────────
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
-    """Один вызов — один текст. Rate limit соблюдается."""
     response = await client.post(
         EMBEDDINGS_DENSE_URL,
         **get_upstream_request_kwargs(),
@@ -349,11 +265,9 @@ async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
         },
     )
     response.raise_for_status()
-
     payload = DenseEmbeddingResponse.model_validate(response.json())
     if not payload.data:
         raise ValueError("Dense embedding response is empty")
-
     return payload.data[0].embedding
 
 
@@ -361,7 +275,6 @@ async def embed_sparse(text: str) -> SparseVector:
     vectors = list(get_sparse_model().embed([text]))
     if not vectors:
         raise ValueError("Sparse embedding response is empty")
-
     item = vectors[0]
     return SparseVector(
         indices=[int(i) for i in item.indices.tolist()],
@@ -375,8 +288,12 @@ async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
     sparse_vector: SparseVector,
-    query_filter: models.Filter | None = None,
 ) -> list[Any] | None:
+    """
+    Hybrid search: dense + sparse prefetch, слияние через RRF.
+    Фильтры по метадате намеренно не применяются — неизвестный формат
+    полей в Qdrant может обнулить Recall для целых категорий вопросов.
+    """
     response = await client.query_points(
         collection_name=QDRANT_COLLECTION_NAME,
         prefetch=[
@@ -384,7 +301,6 @@ async def qdrant_search(
                 query=dense_vector,
                 using=QDRANT_DENSE_VECTOR_NAME,
                 limit=DENSE_PREFETCH_K,
-                filter=query_filter,
             ),
             models.Prefetch(
                 query=models.SparseVector(
@@ -393,13 +309,11 @@ async def qdrant_search(
                 ),
                 using=QDRANT_SPARSE_VECTOR_NAME,
                 limit=SPARSE_PREFETCH_K,
-                filter=query_filter,
             ),
         ],
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
-        query_filter=query_filter,
     )
 
     if not response.points:
@@ -436,9 +350,7 @@ async def get_rerank_scores(
         },
     )
     response.raise_for_status()
-
-    payload = response.json()
-    data = payload.get("data") or []
+    data = response.json().get("data") or []
     return [float(sample["score"]) for sample in data]
 
 
@@ -447,7 +359,11 @@ async def rerank_points(
     query: str,
     points: list[Any],
 ) -> list[Any]:
-    """Реранжируем топ-RERANK_LIMIT кандидатов по оригинальному тексту вопроса."""
+    """
+    Реранжируем топ-RERANK_LIMIT кандидатов.
+    Используем оригинальный question.text — он чище для семантической оценки.
+    Остальные кандидаты добавляем в конец (они всё ещё влияют на Recall@50).
+    """
     rerank_candidates = points[:RERANK_LIMIT]
     tail = points[RERANK_LIMIT:]
 
@@ -485,26 +401,23 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     qdrant: AsyncQdrantClient = app.state.qdrant
 
     # 1. Строим запросы
-    dense_query = build_dense_query(question)    # компактный, один вызов к API
+    dense_query = build_dense_query(question)    # компактный, 1 API-вызов
     sparse_query = build_sparse_query(question)  # богатый, локально
 
-    # 2. Embeddings (dense: 1 API-вызов; sparse: локально)
+    # 2. Embeddings
     dense_vector = await embed_dense(http, dense_query)
     sparse_vector = await embed_sparse(sparse_query)
 
-    # 3. Фильтр по метадате (date_range, emails)
-    query_filter = build_qdrant_filter(question)
-
-    # 4. Retrieval через Qdrant (hybrid RRF)
-    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector, query_filter)
+    # 3. Retrieval (без фильтров — максимальный Recall)
+    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector)
 
     if best_points is None:
         return SearchAPIResponse(results=[])
 
-    # 5. Rerank по оригинальному тексту вопроса
+    # 4. Rerank по оригинальному вопросу
     best_points = await rerank_points(http, original_text, list(best_points))
 
-    # 6. Сборка message_ids с дедупликацией
+    # 5. Сборка message_ids с дедупликацией
     seen: set[str] = set()
     message_ids: list[str] = []
     for point in best_points:
@@ -525,22 +438,15 @@ async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
 
     if isinstance(exc, RequestValidationError):
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
     if isinstance(exc, HTTPException):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
     return JSONResponse(status_code=500, content={"detail": detail})
 
 
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(
-        "main:app",
-        host=HOST,
-        port=PORT,
-        reload=False,
-    )
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
 
 
 if __name__ == "__main__":
