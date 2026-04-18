@@ -130,10 +130,11 @@ class SparseVector(BaseModel):
 class SparseEmbeddingResponse(BaseModel):
     vectors: list[SparseVector]
 
+
 # Метадата чанков в Qdrant'e, по которой вы можете фильтровать
 class ChunkMetadata(BaseModel):
     chat_name: str
-    chat_type: str # channel, group, private, thread
+    chat_type: str  # channel, group, private, thread
     chat_id: str
     chat_sn: str
     thread_sn: str | None = None
@@ -166,66 +167,114 @@ async def lifespan(app: FastAPI):
         await app.state.qdrant.close()
 
 
-app = FastAPI(title="Search Service", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Search Service", version="0.3.0", lifespan=lifespan)
 
-# Параметры retrieval
-DENSE_PREFETCH_K = 15       # топ-K для каждого dense-запроса (в т.ч. hyde)
-SPARSE_PREFETCH_K = 40      # топ-K для sparse-запроса
-RETRIEVE_K = 30             # итого после RRF-слияния
-RERANK_LIMIT = 10           # сколько кандидатов отдаём на реранк
-MAX_HYDE_QUERIES = 3        # максимум HyDE-текстов для доп. dense-поиска
-MAX_VARIANT_QUERIES = 2     # максимум вариантов вопроса для доп. dense-поиска
+# ── Параметры retrieval ──────────────────────────────────────────────────────
+DENSE_PREFETCH_K = 15
+SPARSE_PREFETCH_K = 40
+RETRIEVE_K = 30
+RERANK_LIMIT = 10
+
+# Жёсткий лимит символов для dense-запроса (один вызов на вопрос)
+DENSE_QUERY_MAX_CHARS = 512
 
 
-# Вспомогательные функции для построения запроса
+# ── Построение запросов ──────────────────────────────────────────────────────
 
-def build_enriched_query(question: Question) -> str:
+def build_dense_query(question: Question) -> str:
     """
-    Строим обогащённый текст запроса, объединяя:
-    - search_text (если есть) или исходный text
-    - keywords (ключевые слова)
-    - имена людей и прочие named entities
+    Строим ОДИН компактный текст для dense embedding.
+
+    Правило: ровно один HTTP-запрос к dense API на каждый вопрос.
+    HyDE и variants сюда НЕ идут — они длинные и дорогие по символам.
+    Их ценность передаётся через sparse (BM25 работает локально, бесплатно).
+
+    Состав:
+      - search_text (если задан) или text
+      - имена людей / сущностей (критичны для семантического поиска по людям)
     """
-    # Базовый текст: search_text предпочтительнее (он может быть переформулирован)
     base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
 
-    extras: list[str] = []
+    entity_tokens: list[str] = []
+    if question.entities:
+        if question.entities.people:
+            entity_tokens.extend(question.entities.people)
+        if question.entities.names:
+            entity_tokens.extend(question.entities.names)
 
-    # Ключевые слова улучшают sparse-компоненту
+    combined = f"{base}\n{' '.join(entity_tokens)}" if entity_tokens else base
+
+    # Обрезаем на случай очень длинных search_text
+    if len(combined) > DENSE_QUERY_MAX_CHARS:
+        combined = combined[:DENSE_QUERY_MAX_CHARS]
+
+    logger.info("Dense query (%d chars): %r", len(combined), combined[:120])
+    return combined
+
+
+def build_sparse_query(question: Question) -> str:
+    """
+    Богатый текст для sparse (BM25) — локально, rate limit не расходуется.
+
+    Включаем всё:
+      - base text / search_text
+      - keywords
+      - имена/сущности
+      - варианты вопроса
+      - первые строки HyDE-документов (суть без объёма)
+      - date_mentions
+    """
+    parts: list[str] = []
+
+    base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
+    parts.append(base)
+
     if question.keywords:
-        extras.append(" ".join(question.keywords))
+        parts.append(" ".join(question.keywords))
 
-    # Упоминания людей/имён помогают и dense, и sparse
     if question.entities:
         entity_tokens: list[str] = []
         if question.entities.people:
             entity_tokens.extend(question.entities.people)
         if question.entities.names:
             entity_tokens.extend(question.entities.names)
+        if question.entities.documents:
+            entity_tokens.extend(question.entities.documents)
         if entity_tokens:
-            extras.append(" ".join(entity_tokens))
+            parts.append(" ".join(entity_tokens))
 
-    if extras:
-        return base + "\n" + " ".join(extras)
-    return base
+    if question.variants:
+        for v in question.variants[:3]:
+            parts.append(v.strip())
+
+    # Из HyDE берём только первую строку каждого документа (≤200 символов)
+    if question.hyde:
+        for h in question.hyde[:3]:
+            first_line = h.strip().split("\n")[0][:200]
+            if first_line:
+                parts.append(first_line)
+
+    if question.date_mentions:
+        parts.append(" ".join(question.date_mentions))
+
+    combined = "\n".join(filter(None, parts))
+    logger.info("Sparse query (%d chars): %r", len(combined), combined[:120])
+    return combined
 
 
 def build_qdrant_filter(question: Question) -> models.Filter | None:
     """
-    Формируем must-фильтр для Qdrant на основе метаданных вопроса:
-    - date_range  → фильтр по metadata.start / metadata.end
-    - entities    → фильтр по metadata.mentions (emails, links)
+    Фильтр по метадате чанков:
+    - date_range → пересечение временных интервалов
+    - emails     → metadata.mentions содержит email
     """
     conditions: list[Any] = []
 
-    # ── Фильтр по диапазону дат ──────────────────────────────────────────────
     if question.date_range:
         date_filter = _build_date_filter(question.date_range)
         if date_filter:
             conditions.append(date_filter)
 
-    # ── Фильтр по упоминаниям (emails) ───────────────────────────────────────
-    # emails в вопросе с высокой вероятностью фигурируют в mentions чанков
     if question.entities and question.entities.emails:
         for email in question.entities.emails:
             conditions.append(
@@ -242,7 +291,6 @@ def build_qdrant_filter(question: Question) -> models.Filter | None:
 
 
 def _parse_date_to_timestamp(date_str: str) -> int | None:
-    # Пробуем распарсить строку даты в unix-timestamp (UTC).
     formats = [
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M:%SZ",
@@ -259,10 +307,6 @@ def _parse_date_to_timestamp(date_str: str) -> int | None:
 
 
 def _build_date_filter(date_range: DateRange) -> models.Filter | None:
-    """
-    Чанк попадает в результат, если его временной диапазон пересекается
-    с запрашиваемым: chunk.start <= range.to AND chunk.end >= range.from
-    """
     from_ts = _parse_date_to_timestamp(date_range.from_)
     to_ts = _parse_date_to_timestamp(date_range.to)
 
@@ -271,18 +315,14 @@ def _build_date_filter(date_range: DateRange) -> models.Filter | None:
         return None
 
     sub_conditions: list[Any] = []
-
     if to_ts is not None:
-        # конец чанка должен быть до (или равен) верхней границе
         sub_conditions.append(
             models.FieldCondition(
                 key="metadata.date_start",
                 range=models.Range(lte=to_ts),
             )
         )
-
     if from_ts is not None:
-        # начало чанка должно быть после (или равно) нижней границе
         sub_conditions.append(
             models.FieldCondition(
                 key="metadata.date_end",
@@ -296,10 +336,10 @@ def _build_date_filter(date_range: DateRange) -> models.Filter | None:
     return models.Filter(must=sub_conditions)
 
 
-# Embedding
+# ── Embedding ────────────────────────────────────────────────────────────────
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
-    # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
+    """Один вызов — один текст. Rate limit соблюдается."""
     response = await client.post(
         EMBEDDINGS_DENSE_URL,
         **get_upstream_request_kwargs(),
@@ -317,30 +357,6 @@ async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     return payload.data[0].embedding
 
 
-async def embed_dense_batch(
-    client: httpx.AsyncClient,
-    texts: list[str],
-) -> list[list[float]]:
-    # Батчевый dense embedding — один HTTP-запрос на все тексты.
-    if not texts:
-        return []
-
-    response = await client.post(
-        EMBEDDINGS_DENSE_URL,
-        **get_upstream_request_kwargs(),
-        json={
-            "model": os.getenv("EMBEDDINGS_DENSE_MODEL", EMBEDDINGS_DENSE_MODEL),
-            "input": texts,
-        },
-    )
-    response.raise_for_status()
-
-    payload = DenseEmbeddingResponse.model_validate(response.json())
-    # API возвращает элементы в произвольном порядке с полем index — сортируем
-    sorted_data = sorted(payload.data, key=lambda d: d.index)
-    return [item.embedding for item in sorted_data]
-
-
 async def embed_sparse(text: str) -> SparseVector:
     vectors = list(get_sparse_model().embed([text]))
     if not vectors:
@@ -353,47 +369,33 @@ async def embed_sparse(text: str) -> SparseVector:
     )
 
 
-# Qdrant search
+# ── Qdrant search ────────────────────────────────────────────────────────────
 
 async def qdrant_search(
     client: AsyncQdrantClient,
-    dense_vectors: list[list[float]],   # первый — основной запрос, остальные — HyDE/варианты
+    dense_vector: list[float],
     sparse_vector: SparseVector,
     query_filter: models.Filter | None = None,
 ) -> list[Any] | None:
-    """
-    Hybrid search с поддержкой нескольких dense-векторов (HyDE + варианты).
-    Каждый dense-вектор становится отдельным Prefetch, все они сливаются через RRF.
-    """
-    prefetches: list[models.Prefetch] = []
-
-    # Dense prefetch для каждого вектора (основной + HyDE + варианты)
-    for vec in dense_vectors:
-        prefetches.append(
+    response = await client.query_points(
+        collection_name=QDRANT_COLLECTION_NAME,
+        prefetch=[
             models.Prefetch(
-                query=vec,
+                query=dense_vector,
                 using=QDRANT_DENSE_VECTOR_NAME,
                 limit=DENSE_PREFETCH_K,
                 filter=query_filter,
-            )
-        )
-
-    # Sparse prefetch (один — для основного/обогащённого запроса)
-    prefetches.append(
-        models.Prefetch(
-            query=models.SparseVector(
-                indices=sparse_vector.indices,
-                values=sparse_vector.values,
             ),
-            using=QDRANT_SPARSE_VECTOR_NAME,
-            limit=SPARSE_PREFETCH_K,
-            filter=query_filter,
-        )
-    )
-
-    response = await client.query_points(
-        collection_name=QDRANT_COLLECTION_NAME,
-        prefetch=prefetches,
+            models.Prefetch(
+                query=models.SparseVector(
+                    indices=sparse_vector.indices,
+                    values=sparse_vector.values,
+                ),
+                using=QDRANT_SPARSE_VECTOR_NAME,
+                limit=SPARSE_PREFETCH_K,
+                filter=query_filter,
+            ),
+        ],
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
@@ -406,7 +408,7 @@ async def qdrant_search(
     return response.points
 
 
-# Reranking
+# ── Reranking ────────────────────────────────────────────────────────────────
 
 def extract_message_ids(point: Any) -> list[str]:
     payload = point.payload or {}
@@ -423,7 +425,6 @@ async def get_rerank_scores(
     if not targets:
         return []
 
-    # Rerank endpoint возвращает score для пары query -> candidate text.
     response = await client.post(
         RERANKER_URL,
         **get_upstream_request_kwargs(),
@@ -438,7 +439,6 @@ async def get_rerank_scores(
 
     payload = response.json()
     data = payload.get("data") or []
-
     return [float(sample["score"]) for sample in data]
 
 
@@ -447,14 +447,14 @@ async def rerank_points(
     query: str,
     points: list[Any],
 ) -> list[Any]:
-    # Реранжируем топ-RERANK_LIMIT кандидатов, остальные добавляем в конец.
+    """Реранжируем топ-RERANK_LIMIT кандидатов по оригинальному тексту вопроса."""
     rerank_candidates = points[:RERANK_LIMIT]
     tail = points[RERANK_LIMIT:]
 
     rerank_targets = [point.payload.get("page_content") for point in rerank_candidates]
     scores = await get_rerank_scores(client, query, rerank_targets)
 
-    reranked_candidates = [
+    reranked = [
         point
         for _, point in sorted(
             zip(scores, rerank_candidates, strict=True),
@@ -463,10 +463,10 @@ async def rerank_points(
         )
     ]
 
-    return reranked_candidates + tail
+    return reranked + tail
 
 
-# Endpoints
+# ── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health() -> dict[str, str]:
@@ -484,46 +484,27 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     http: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    # Строим обогащённый запрос
-    enriched_query = build_enriched_query(question)
-    logger.debug("Enriched query: %r", enriched_query)
+    # 1. Строим запросы
+    dense_query = build_dense_query(question)    # компактный, один вызов к API
+    sparse_query = build_sparse_query(question)  # богатый, локально
 
-    # Собираем тексты для батчевого dense embedding
-    # Порядок: [enriched_query, *hyde[:MAX], *variants[:MAX]]
-    embed_texts: list[str] = [enriched_query]
+    # 2. Embeddings (dense: 1 API-вызов; sparse: локально)
+    dense_vector = await embed_dense(http, dense_query)
+    sparse_vector = await embed_sparse(sparse_query)
 
-    if question.hyde:
-        hyde_texts = question.hyde[:MAX_HYDE_QUERIES]
-        embed_texts.extend(hyde_texts)
-        logger.debug("Adding %d HyDE texts", len(hyde_texts))
-
-    if question.variants:
-        variant_texts = question.variants[:MAX_VARIANT_QUERIES]
-        embed_texts.extend(variant_texts)
-        logger.debug("Adding %d variant texts", len(variant_texts))
-
-    # Dense embedding (один батч-запрос)
-    dense_vectors = await embed_dense_batch(http, embed_texts)
-
-    # Sparse embedding (по обогащённому запросу
-    sparse_vector = await embed_sparse(enriched_query)
-
-    #  Фильтр по метадате
+    # 3. Фильтр по метадате (date_range, emails)
     query_filter = build_qdrant_filter(question)
-    if query_filter:
-        logger.debug("Applying Qdrant filter: %s", query_filter)
 
-    # Retrieval
-    best_points = await qdrant_search(qdrant, dense_vectors, sparse_vector, query_filter)
+    # 4. Retrieval через Qdrant (hybrid RRF)
+    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector, query_filter)
 
     if best_points is None:
-        logger.info("No points found for query: %r", original_text)
         return SearchAPIResponse(results=[])
 
-    # Rerank (используем оригинальный вопрос для точности реранка)
+    # 5. Rerank по оригинальному тексту вопроса
     best_points = await rerank_points(http, original_text, list(best_points))
 
-    # Собираем message_ids
+    # 6. Сборка message_ids с дедупликацией
     seen: set[str] = set()
     message_ids: list[str] = []
     for point in best_points:
