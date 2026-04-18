@@ -190,7 +190,7 @@ def build_dense_chunk_text(messages: list[Message]) -> str:
 def build_sparse_chunk_text(messages: list[Message]) -> str:
     return "\n".join(filter(None, (prepare_sparse_content(message) for message in messages)))
 
-def truncate_content(text: str, max_chars: int = 10000) -> str:
+def truncate_content(text: str, max_chars: int = 6000) -> str:
     if len(text) <= max_chars:
         return text
 
