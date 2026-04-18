@@ -1,14 +1,13 @@
 import logging
 import os
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 import asyncio
-import hashlib
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Ваш сервис должен считывать эти переменные из окружения (env), так как проверяющая система управляет ими
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -64,6 +63,13 @@ class IndexAPIItem(BaseModel):
     dense_content: str
     sparse_content: str
     message_ids: list[str]
+    # Метаданные
+    participants: list[str] = Field(default_factory=list)
+    mentions: list[str] = Field(default_factory=list)
+    has_forward: bool = False
+    has_quote: bool = False
+    date_start: Optional[int] = None
+    date_end: Optional[int] = None
 
 
 class IndexAPIResponse(BaseModel):
@@ -97,23 +103,92 @@ FASTEMBED_CACHE_PATH = "/models/fastembed"
 UVICORN_WORKERS=8
 
 def render_message(message: Message) -> str:
-    text = ""
+    if message.is_hidden or message.is_system:
+        return ""
+
+    parts = [f"[{message.sender_id}]"]
+
+    if message.is_forward:
+        parts.append("[FORWARD]")
+
+    if message.is_quote:
+        parts.append(f"[QUOTE]")
 
     if message.text:
-        text += message.text
+        parts.append(message.text)
 
     if message.parts:
-        parts_text: list[str] = []
         for part in message.parts:
-            # parts различаются по своему типу, см. README.md
+            if not isinstance(part, dict):
+                continue
             part_text = part.get("text")
             if isinstance(part_text, str) and part_text:
-                parts_text.append(part_text)
-        if parts_text:
-            text += "\n".join(parts_text)
+                media_type = part.get("mediaType")
 
-    return text
+                if media_type == "forward":
+                    parts.append(f"[FORWARD] {part_text}")
+                elif media_type == "quote":
+                    parts.append(f"[QUOTE] {part_text}")
+                else:
+                    parts.append(part_text)
 
+    if message.mentions:
+        parts.append(f"[MENTIONS] {', '.join(message.mentions)}")
+
+    return "\n".join(filter(None, parts))
+
+def _prepare_base_content(
+    message: Message,
+    *,
+    forward_quote_limit: int,
+    regular_part_limit: int,
+) -> str:
+    if message.is_hidden or message.is_system:
+        return ""
+
+    parts: list[str] = []
+
+    if message.text:
+        parts.append(message.text)
+
+    if message.parts:
+        for part in message.parts:
+            if not isinstance(part, dict):
+                continue
+            part_text = part.get("text")
+            if not isinstance(part_text, str) or not part_text:
+                continue
+
+            media_type = part.get("mediaType")
+            if media_type in {"forward", "quote"}:
+                first_line = part_text.split("\n", 1)[0]
+                parts.append(first_line[:forward_quote_limit])
+            else:
+                parts.append(part_text[:regular_part_limit])
+
+    return "\n".join(filter(None, parts))
+
+
+def prepare_dense_content(message: Message) -> str:
+    return _prepare_base_content(
+        message,
+        forward_quote_limit=180,
+        regular_part_limit=600,
+    )
+
+
+def prepare_sparse_content(message: Message) -> str:
+    return _prepare_base_content(
+        message,
+        forward_quote_limit=80,
+        regular_part_limit=250,
+    )
+
+def build_dense_chunk_text(messages: list[Message]) -> str:
+    return "\n".join(filter(None, (prepare_dense_content(message) for message in messages)))
+
+def build_sparse_chunk_text(messages: list[Message]) -> str:
+    return "\n".join(filter(None, (prepare_sparse_content(message) for message in messages)))
 
 def build_chunks(
     overlap_messages: list[Message],
@@ -121,9 +196,9 @@ def build_chunks(
 ) -> list[IndexAPIItem]:
     result: list[IndexAPIItem] = []
 
-    def build_text_and_ranges(messages: list[Message]) -> tuple[str, list[tuple[int, int, str]]]:
+    def build_text_and_ranges(messages: list[Message]) -> tuple[str, list[tuple[int, int, str, Message]]]:
         text_parts: list[str] = []
-        message_ranges: list[tuple[int, int, str]] = []
+        message_ranges: list[tuple[int, int, str, Message]] = []
         position = 0
 
         for index, message in enumerate(messages):
@@ -138,7 +213,7 @@ def build_chunks(
             start = position
             text_parts.append(text)
             position += len(text)
-            message_ranges.append((start, position, message.id))
+            message_ranges.append((start, position, message.id, message))
 
         return "".join(text_parts), message_ranges
 
@@ -152,7 +227,7 @@ def build_chunks(
         tail_start = max(0, len(text) - tail_size)
         return text[tail_start:]
 
-    overlap_text, overlap_message_ranges = build_text_and_ranges(overlap_messages)
+    overlap_text, _ = build_text_and_ranges(overlap_messages)
     previous_chunk_text = slice_tail(overlap_text, OVERLAP_SIZE)
 
     new_text, new_message_ranges = build_text_and_ranges(new_messages)
@@ -167,8 +242,9 @@ def build_chunks(
                 max(message_start, start) - start,
                 min(message_end, start + len(chunk_body)) - start,
                 message_id,
+                message
             )
-            for message_start, message_end, message_id in new_message_ranges
+            for message_start, message_end, message_id, message in new_message_ranges
             if message_end > start and message_start < start + len(chunk_body)
         ]
         chunk_overlap = previous_chunk_text
@@ -177,12 +253,39 @@ def build_chunks(
             chunk_text += "\n"
         chunk_text += chunk_body
 
+        chunk_messages = [message for _, _, _, message in chunk_body_ranges]
+
+        overlap_dense = "\n".join(filter(None, (prepare_dense_content(msg) for msg in overlap_messages)))
+        dense_content = (overlap_dense + '\n' if overlap_dense else "") + build_dense_chunk_text(chunk_messages)
+
+        overlap_sparse = "\n".join(filter(None, (prepare_sparse_content(msg) for msg in overlap_messages)))
+        sparse_content = (overlap_dense + '\n' if overlap_sparse else "") + build_sparse_chunk_text(chunk_messages)
+
+        participants = set(msg.sender_id for msg in chunk_messages)
+        all_mentions = set()
+        for msg in chunk_messages:
+            if msg.mentions:
+                all_mentions.update(msg.mentions)
+
+        has_forward = any(msg.is_forward for msg in chunk_messages)
+        has_quote = any(msg.is_quote for msg in chunk_messages)
+
+        chunk_timestamps = [msg.time for msg in chunk_messages if msg.time]
+        date_start = min(chunk_timestamps) if chunk_timestamps else None
+        date_end = max(chunk_timestamps) if chunk_timestamps else None
+
         result.append(
             IndexAPIItem(
                 page_content=chunk_text,
-                dense_content=chunk_text,
-                sparse_content=chunk_text,
-                message_ids=[message_id for _, _, message_id in chunk_body_ranges],
+                dense_content= dense_content or chunk_text,
+                sparse_content=sparse_content or chunk_text,
+                message_ids=[message_id for _, _, message_id, _ in chunk_body_ranges],
+                participants=list(participants),
+                mentions=list(all_mentions),
+                has_forward=has_forward,
+                has_quote=has_quote,
+                date_start=date_start,
+                date_end=date_end,
             )
         )
         previous_chunk_text = slice_tail(chunk_text, OVERLAP_SIZE)
@@ -221,14 +324,14 @@ def get_sparse_model():
 
 def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
     model = get_sparse_model()
-    vectors: list[dict[str, list[int] | list[float]]] = []
+    vectors: list[SparseVector] = []
 
     for item in model.embed(texts):
         vectors.append(
-            {
-                "indices": item.indices.tolist(),
-                "values": item.values.tolist(),
-            }
+            SparseVector(
+                indices = item.indices.tolist(),
+                values = item.values.tolist(),
+            )
         )
 
     return vectors
