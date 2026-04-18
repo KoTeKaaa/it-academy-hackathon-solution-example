@@ -190,17 +190,17 @@ def build_dense_chunk_text(messages: list[Message]) -> str:
 def build_sparse_chunk_text(messages: list[Message]) -> str:
     return "\n".join(filter(None, (prepare_sparse_content(message) for message in messages)))
 
-def truncate_content(text: str, max_chars: int = 3500) -> str:
-    if len(text) <= max_chars:
-        return text
-
-    truncated = text[:max_chars]
-    last_newline = truncated.rfind('\n')
-
-    if last_newline > max_chars * 0.7:
-        return truncated[:last_newline]
-
-    return truncated
+# def truncate_content(text: str, max_chars: int = 3500) -> str:
+#     if len(text) <= max_chars:
+#         return text
+#
+#     truncated = text[:max_chars]
+#     last_newline = truncated.rfind('\n')
+#
+#     if last_newline > max_chars * 0.7:
+#         return truncated[:last_newline]
+#
+#     return truncated
 
 
 def build_chunks(
@@ -288,8 +288,9 @@ def build_chunks(
         result.append(
             IndexAPIItem(
                 page_content=chunk_text,
-                dense_content=truncate_content(dense_content) or chunk_text,
-                sparse_content=truncate_content(sparse_content) or chunk_text,
+                # добавить truncate_content for dense and sparse content
+                dense_content=dense_content or chunk_text,
+                sparse_content=sparse_content or chunk_text,
                 message_ids=[message_id for _, _, message_id, _ in chunk_body_ranges],
                 participants=list(participants),
                 mentions=list(all_mentions),
