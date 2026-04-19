@@ -209,12 +209,7 @@ CHAT_TYPE_RU = {
 
 
 def chat_header(chat: Chat) -> str:
-    """
-    Строка-заголовок чанка с контекстом чата.
-    Помогает находить чанки по вопросам вида:
-      «В какой чат писать про X?»
-      «Где обсуждали Y?»
-    """
+    # Строка-заголовок чанка с контекстом чата.
     chat_type_label = CHAT_TYPE_RU.get(chat.type, chat.type)
     return f"[{chat_type_label}: {chat.name}]"
 
@@ -227,17 +222,16 @@ def enrich_sparse_content(
     has_quote: bool,
 ) -> str:
     """
-    Для BM25 добавляем:
-    - название чата (точный матч по имени)
+    - название чата
     - сигналы о наличии forward/quote для фильтрации
-    - упоминания (@-теги, имена) из сообщений
+    - упоминания из сообщений
     """
     extra_parts: list[str] = [base_sparse]
 
     # Название чата
     extra_parts.append(chat.name)
 
-    # Упоминания — часто это имена людей или username'ы
+    # Упоминания
     if mentions:
         extra_parts.append(" ".join(sorted(mentions)))
 
@@ -313,15 +307,11 @@ def build_chunks(
 
         chunk_messages = [message for _, _, _, message in chunk_body_ranges]
 
-        # page_content: заголовок чата + полный текст чанка
-        # Реранкер видит этот текст -> заголовок помогает ему понять контекст
         page_content = f"{header}\n{chunk_text}"
 
-        # dense_content: заголовок + семантически богатый текст сообщений
         raw_dense = build_dense_chunk_text(chunk_messages)
         dense_content = f"{header}\n{truncate_content(raw_dense)}" if raw_dense else page_content
 
-        # sparse_content: добавляем chat.name, тип и упоминания -> лексический охват
         raw_sparse = build_sparse_chunk_text(chunk_messages)
         all_mentions: set[str] = set()
         for msg in chunk_messages:
