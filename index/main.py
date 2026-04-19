@@ -1,355 +1,396 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any, Optional
-import asyncio
+from typing import Any
 
-from fastapi import FastAPI, Request
+import httpx
+from fastembed import SparseTextEmbedding
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from qdrant_client import AsyncQdrantClient, models
+
+EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8004"))
+PORT = int(os.getenv("PORT", "8003"))
+
+API_KEY = os.getenv("API_KEY")
+EMBEDDINGS_DENSE_URL = os.getenv("EMBEDDINGS_DENSE_URL")
+QDRANT_DENSE_VECTOR_NAME = os.getenv("QDRANT_DENSE_VECTOR_NAME", "dense")
+QDRANT_SPARSE_VECTOR_NAME = os.getenv("QDRANT_SPARSE_VECTOR_NAME", "sparse")
+SPARSE_MODEL_NAME = "Qdrant/bm25"
+RERANKER_MODEL = "nvidia/llama-nemotron-rerank-1b-v2"
+RERANKER_URL = os.getenv("RERANKER_URL")
+OPEN_API_LOGIN = os.getenv("OPEN_API_LOGIN")
+OPEN_API_PASSWORD = os.getenv("OPEN_API_PASSWORD")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "evaluation")
+REQUIRED_ENV_VARS = [
+    "EMBEDDINGS_DENSE_URL",
+    "RERANKER_URL",
+    "QDRANT_URL",
+]
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("index-service")
+logger = logging.getLogger("search-service")
 
 
-class Chat(BaseModel):
-    id: str
-    name: str
-    sn: str
-    type: str  # group, channel, private
-    is_public: bool | None = None
-    members_count: int | None = None
-    members: list[dict[str, Any]] | None = None
+def validate_required_env() -> None:
+    if bool(OPEN_API_LOGIN) != bool(OPEN_API_PASSWORD):
+        raise RuntimeError("OPEN_API_LOGIN and OPEN_API_PASSWORD must be set together")
+
+    if not API_KEY and not (OPEN_API_LOGIN and OPEN_API_PASSWORD):
+        raise RuntimeError("Either API_KEY or OPEN_API_LOGIN and OPEN_API_PASSWORD must be set")
+
+    missing_env_vars = [
+        name for name in REQUIRED_ENV_VARS if os.getenv(name) is None or os.getenv(name) == ""
+    ]
+    if not missing_env_vars:
+        return
+
+    logger.error("Empty required env vars: %s", ", ".join(missing_env_vars))
+    raise RuntimeError(f"Empty required env vars: {', '.join(missing_env_vars)}")
 
 
-class Message(BaseModel):
-    id: str
-    thread_sn: str | None = None
-    time: int
+validate_required_env()
+
+
+def get_upstream_request_kwargs() -> dict[str, Any]:
+    headers = {"Content-Type": "application/json"}
+    kwargs: dict[str, Any] = {"headers": headers}
+
+    if OPEN_API_LOGIN and OPEN_API_PASSWORD:
+        kwargs["auth"] = (OPEN_API_LOGIN, OPEN_API_PASSWORD)
+        return kwargs
+
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+
+    return kwargs
+
+
+class DateRange(BaseModel):
+    from_: str = Field(alias="from")
+    to: str
+
+
+class Entities(BaseModel):
+    people: list[str] | None = None
+    emails: list[str] | None = None
+    documents: list[str] | None = None
+    names: list[str] | None = None
+    links: list[str] | None = None
+
+
+class Question(BaseModel):
     text: str
-    sender_id: str
-    file_snippets: str
-    parts: list[dict[str, Any]] | None = None
-    mentions: list[str] | None = None
-    member_event: dict[str, Any] | None = None
-    is_system: bool
-    is_hidden: bool
-    is_forward: bool
-    is_quote: bool
+    asker: str = ""
+    asked_on: str = ""
+    variants: list[str] | None = None
+    hyde: list[str] | None = None
+    keywords: list[str] | None = None
+    entities: Entities | None = None
+    date_mentions: list[str] | None = None
+    date_range: DateRange | None = None
+    search_text: str = ""
 
 
-class ChatData(BaseModel):
-    chat: Chat
-    overlap_messages: list[Message]
-    new_messages: list[Message]
+class SearchAPIRequest(BaseModel):
+    question: Question
 
 
-class IndexAPIRequest(BaseModel):
-    data: ChatData
-
-
-class IndexAPIItem(BaseModel):
-    page_content: str
-    dense_content: str
-    sparse_content: str
+class SearchAPIItem(BaseModel):
     message_ids: list[str]
-    participants: list[str] = Field(default_factory=list)
-    mentions: list[str] = Field(default_factory=list)
-    has_forward: bool = False
-    has_quote: bool = False
-    date_start: Optional[int] = None
-    date_end: Optional[int] = None
 
 
-class IndexAPIResponse(BaseModel):
-    results: list[IndexAPIItem]
+class SearchAPIResponse(BaseModel):
+    results: list[SearchAPIItem]
 
 
-class SparseEmbeddingRequest(BaseModel):
-    texts: list[str]
+class DenseEmbeddingItem(BaseModel):
+    index: int
+    embedding: list[float]
+
+
+class DenseEmbeddingResponse(BaseModel):
+    data: list[DenseEmbeddingItem]
 
 
 class SparseVector(BaseModel):
-    indices: list[int]
-    values: list[float]
+    indices: list[int] = Field(default_factory=list)
+    values: list[float] = Field(default_factory=list)
 
 
-class SparseEmbeddingResponse(BaseModel):
-    vectors: list[SparseVector]
+class ChunkMetadata(BaseModel):
+    chat_name: str
+    chat_type: str
+    chat_id: str
+    chat_sn: str
+    thread_sn: str | None = None
+    message_ids: list[str]
+    start: str
+    end: str
+    participants: list[str] = Field(default_factory=list)
+    mentions: list[str] = Field(default_factory=list)
+    contains_forward: bool = False
+    contains_quote: bool = False
 
 
-app = FastAPI(title="Index Service", version="0.2.0")
-
-CHUNK_SIZE = 512
-OVERLAP_SIZE = 256
-SPARSE_MODEL_NAME = "Qdrant/bm25"
-FASTEMBED_CACHE_PATH = "/models/fastembed"
-UVICORN_WORKERS = 8
+@lru_cache(maxsize=1)
+def get_sparse_model() -> SparseTextEmbedding:
+    logger.info("Loading local sparse model %s", SPARSE_MODEL_NAME)
+    return SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
 
 
-def render_message(message: Message) -> str:
-    """Полный рендер для page_content — сохраняем структуру."""
-    if message.is_hidden or message.is_system:
-        return ""
-
-    parts = [f"[{message.sender_id}]"]
-
-    if message.is_forward:
-        parts.append("[FORWARD]")
-    if message.is_quote:
-        parts.append("[QUOTE]")
-    if message.file_snippets:
-        parts.append(f"[FILE]\n{message.file_snippets}")
-    if message.text:
-        parts.append(message.text)
-
-    if message.parts:
-        for part in message.parts:
-            if not isinstance(part, dict):
-                continue
-            part_text = part.get("text")
-            if isinstance(part_text, str) and part_text:
-                media_type = part.get("mediaType")
-                if media_type == "forward":
-                    parts.append(f"[FORWARD] {part_text}")
-                elif media_type == "quote":
-                    parts.append(f"[QUOTE] {part_text}")
-                else:
-                    parts.append(part_text)
-
-    if message.mentions:
-        parts.append(f"[MENTIONS] {', '.join(message.mentions)}")
-
-    return "\n".join(filter(None, parts))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient()
+    app.state.qdrant = AsyncQdrantClient(url=QDRANT_URL, api_key=API_KEY)
+    try:
+        yield
+    finally:
+        await app.state.http.aclose()
+        await app.state.qdrant.close()
 
 
-def _prepare_base_content(
-    message: Message,
-    *,
-    forward_quote_limit: int,
-    regular_part_limit: int,
-) -> str:
-    if message.is_hidden or message.is_system:
-        return ""
+app = FastAPI(title="Search Service", version="0.5.0", lifespan=lifespan)
 
-    parts: list[str] = []
+DENSE_PREFETCH_K = 20
 
-    if message.text:
-        parts.append(message.text)
+SPARSE_MAIN_K = 50
+SPARSE_KEYWORDS_K = 40
+SPARSE_VARIANT_K = 30
+SPARSE_HYDE_K = 25
 
-    if message.parts:
-        for part in message.parts:
-            if not isinstance(part, dict):
-                continue
-            part_text = part.get("text")
-            if not isinstance(part_text, str) or not part_text:
-                continue
-            media_type = part.get("mediaType")
-            if media_type in {"forward", "quote"}:
-                first_line = part_text.split("\n", 1)[0]
-                parts.append(first_line[:forward_quote_limit])
-            else:
-                parts.append(part_text[:regular_part_limit])
+RETRIEVE_K = 60
+RERANK_LIMIT = 20
 
-    return "\n".join(filter(None, parts))
-
-def prepare_dense_content(message: Message) -> str:
-    if message.is_hidden or message.is_system:
-        return ""
-
-    parts: list[str] = []
-
-    if message.text:
-        parts.append(message.text)
-
-    if message.parts:
-        for part in message.parts:
-            if not isinstance(part, dict):
-                continue
-            part_text = part.get("text")
-            if not isinstance(part_text, str) or not part_text:
-                continue
-            parts.append(part_text[:600])
-
-    return "\n".join(filter(None, parts))
+DENSE_QUERY_MAX_CHARS = 512
 
 
-def prepare_sparse_content(message: Message) -> str:
-    return _prepare_base_content(message, forward_quote_limit=80, regular_part_limit=250)
+def build_dense_query(question: Question) -> str:
+    base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
+
+    entity_tokens: list[str] = []
+    if question.entities:
+        if question.entities.people:
+            entity_tokens.extend(question.entities.people)
+        if question.entities.names:
+            entity_tokens.extend(question.entities.names)
+
+    combined = f"{base}\n{' '.join(entity_tokens)}" if entity_tokens else base
+
+    if len(combined) > DENSE_QUERY_MAX_CHARS:
+        combined = combined[:DENSE_QUERY_MAX_CHARS]
+
+    logger.info("Dense query (%d chars): %r", len(combined), combined[:120])
+    return combined
 
 
-def build_dense_chunk_text(messages: list[Message]) -> str:
-    return "\n".join(filter(None, (prepare_dense_content(m) for m in messages)))
+def build_sparse_queries(question: Question) -> list[tuple[str, str, int]]:
+    base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
+
+    # Собираем переиспользуемые части
+    entity_tokens: list[str] = []
+    if question.entities:
+        for field in (question.entities.people, question.entities.names, question.entities.documents):
+            if field:
+                entity_tokens.extend(field)
+
+    keyword_str = " ".join(question.keywords) if question.keywords else ""
+    date_str = " ".join(question.date_mentions) if question.date_mentions else ""
+
+    branches: list[tuple[str, str, int]] = []
+
+    # main enriched
+    main_parts = [base]
+    if keyword_str:
+        main_parts.append(keyword_str)
+    if entity_tokens:
+        main_parts.append(" ".join(entity_tokens))
+    if date_str:
+        main_parts.append(date_str)
+    branches.append(("main_enriched", "\n".join(filter(None, main_parts)), SPARSE_MAIN_K))
+
+    # keywords only
+    # Если keywords нет — строим из entities, чтобы ветка не пустовала
+    keywords_text = " ".join(filter(None, [keyword_str, " ".join(entity_tokens)]))
+    if keywords_text.strip():
+        branches.append(("keywords_only", keywords_text, SPARSE_KEYWORDS_K))
+
+    # варианты вопроса
+    if question.variants:
+        for i, variant in enumerate(question.variants[:2]):
+            v = variant.strip()
+            if v:
+                # Обогащаем вариант keywords для лучшего покрытия
+                v_text = f"{v}\n{keyword_str}" if keyword_str else v
+                branches.append((f"variant_{i}", v_text, SPARSE_VARIANT_K))
+
+    # HyDE первая строка
+    if question.hyde:
+        first_line = question.hyde[0].strip().split("\n")[0][:300]
+        if first_line:
+            branches.append(("hyde_0", first_line, SPARSE_HYDE_K))
+
+    logger.info(
+        "Sparse branches: %s",
+        [(name, len(text), k) for name, text, k in branches],
+    )
+    return branches
 
 
-def build_sparse_chunk_text(messages: list[Message]) -> str:
-    return "\n".join(filter(None, (prepare_sparse_content(m) for m in messages)))
+async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
+    response = await client.post(
+        EMBEDDINGS_DENSE_URL,
+        **get_upstream_request_kwargs(),
+        json={
+            "model": os.getenv("EMBEDDINGS_DENSE_MODEL", EMBEDDINGS_DENSE_MODEL),
+            "input": [text],
+        },
+    )
+    response.raise_for_status()
+    payload = DenseEmbeddingResponse.model_validate(response.json())
+    if not payload.data:
+        raise ValueError("Dense embedding response is empty")
+    return payload.data[0].embedding
 
 
-def truncate_content(text: str, max_chars: int = 4000) -> str:
-    if len(text) <= max_chars:
-        return text
-    truncated = text[:max_chars]
-    last_newline = truncated.rfind("\n")
-    if last_newline > max_chars * 0.7:
-        return truncated[:last_newline]
-    return truncated
-
-
-CHAT_TYPE_RU = {
-    "channel": "канал",
-    "group": "группа",
-    "private": "личный чат",
-    "thread": "тред",
-}
-
-
-def chat_header(chat: Chat) -> str:
-    # Строка-заголовок чанка с контекстом чата.
-    chat_type_label = CHAT_TYPE_RU.get(chat.type, chat.type)
-    return f"[{chat_type_label}: {chat.name}]"
-
-
-def enrich_sparse_content(
-    base_sparse: str,
-    chat: Chat,
-    mentions: set[str],
-    has_forward: bool,
-    has_quote: bool,
-) -> str:
-    """
-    - название чата
-    - сигналы о наличии forward/quote для фильтрации
-    - упоминания из сообщений
-    """
-    extra_parts: list[str] = [base_sparse]
-
-    # Название чата
-    extra_parts.append(chat.name)
-
-    # Упоминания
-    if mentions:
-        extra_parts.append(" ".join(sorted(mentions)))
-
-    # Маркеры для поиска по типам контента
-    if has_forward:
-        extra_parts.append("forward")
-    if has_quote:
-        extra_parts.append("quote")
-
-    return "\n".join(filter(None, extra_parts))
-
-
-def build_chunks(
-    chat: Chat,
-    overlap_messages: list[Message],
-    new_messages: list[Message],
-) -> list[IndexAPIItem]:
-    result: list[IndexAPIItem] = []
-    header = chat_header(chat)
-
-    def build_text_and_ranges(
-        messages: list[Message],
-    ) -> tuple[str, list[tuple[int, int, str, Message]]]:
-        text_parts: list[str] = []
-        message_ranges: list[tuple[int, int, str, Message]] = []
-        position = 0
-
-        for index, message in enumerate(messages):
-            text = render_message(message)
-            if not text:
-                continue
-            if index > 0 and text_parts:
-                text_parts.append("\n")
-                position += 1
-            start = position
-            text_parts.append(text)
-            position += len(text)
-            message_ranges.append((start, position, message.id, message))
-
-        return "".join(text_parts), message_ranges
-
-    def slice_tail(text: str, tail_size: int) -> str:
-        if tail_size <= 0:
-            return ""
-        return text[max(0, len(text) - tail_size):]
-
-    overlap_text, _ = build_text_and_ranges(overlap_messages)
-    previous_chunk_text = slice_tail(overlap_text, OVERLAP_SIZE)
-
-    new_text, new_message_ranges = build_text_and_ranges(new_messages)
-
-    for start in range(0, len(new_text), CHUNK_SIZE):
-        chunk_body = new_text[start : start + CHUNK_SIZE]
-        if not chunk_body:
-            continue
-
-        chunk_body_ranges = [
-            (
-                max(message_start, start) - start,
-                min(message_end, start + len(chunk_body)) - start,
-                message_id,
-                message,
-            )
-            for message_start, message_end, message_id, message in new_message_ranges
-            if message_end > start and message_start < start + len(chunk_body)
-        ]
-
-        chunk_overlap = previous_chunk_text
-        chunk_text = chunk_overlap
-        if chunk_text and chunk_body:
-            chunk_text += "\n"
-        chunk_text += chunk_body
-
-        chunk_messages = [message for _, _, _, message in chunk_body_ranges]
-
-        page_content = f"{header}\n{chunk_text}"
-
-        raw_dense = build_dense_chunk_text(chunk_messages)
-        dense_content = f"{header}\n{truncate_content(raw_dense)}" if raw_dense else page_content
-
-        raw_sparse = build_sparse_chunk_text(chunk_messages)
-        all_mentions: set[str] = set()
-        for msg in chunk_messages:
-            if msg.mentions:
-                all_mentions.update(msg.mentions)
-
-        participants = {msg.sender_id for msg in chunk_messages}
-        has_forward = any(msg.is_forward for msg in chunk_messages)
-        has_quote = any(msg.is_quote for msg in chunk_messages)
-        chunk_timestamps = [msg.time for msg in chunk_messages if msg.time]
-        date_start = min(chunk_timestamps) if chunk_timestamps else None
-        date_end = max(chunk_timestamps) if chunk_timestamps else None
-
-        sparse_content = enrich_sparse_content(
-            truncate_content(raw_sparse) if raw_sparse else chunk_text,
-            chat,
-            all_mentions,
-            has_forward=has_forward,
-            has_quote=has_quote,
-        )
-
+def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
+    "Батчевый sparse embedding — один вызов модели для всех текстов."
+    model = get_sparse_model()
+    result: list[SparseVector] = []
+    for item in model.embed(texts):
         result.append(
-            IndexAPIItem(
-                page_content=page_content,
-                dense_content=dense_content,
-                sparse_content=sparse_content,
-                message_ids=[message_id for _, _, message_id, _ in chunk_body_ranges],
-                participants=list(participants),
-                mentions=list(all_mentions),
-                has_forward=has_forward,
-                has_quote=has_quote,
-                date_start=date_start,
-                date_end=date_end,
+            SparseVector(
+                indices=[int(i) for i in item.indices.tolist()],
+                values=[float(v) for v in item.values.tolist()],
             )
         )
-        previous_chunk_text = slice_tail(chunk_text, OVERLAP_SIZE)
-
     return result
+
+
+async def qdrant_search(
+    client: AsyncQdrantClient,
+    dense_vector: list[float],
+    sparse_branches: list[tuple[str, SparseVector, int]],  # (name, vector, limit)
+) -> list[Any] | None:
+    #Multi-branch hybrid search.
+    prefetches: list[models.Prefetch] = []
+
+    # Dense ветка (1 штука — rate limit)
+    prefetches.append(
+        models.Prefetch(
+            query=dense_vector,
+            using=QDRANT_DENSE_VECTOR_NAME,
+            limit=DENSE_PREFETCH_K,
+        )
+    )
+
+    # Sparse ветки (N штук — все локальные)
+    for name, sparse_vec, limit in sparse_branches:
+        prefetches.append(
+            models.Prefetch(
+                query=models.SparseVector(
+                    indices=sparse_vec.indices,
+                    values=sparse_vec.values,
+                ),
+                using=QDRANT_SPARSE_VECTOR_NAME,
+                limit=limit,
+            )
+        )
+
+    logger.info(
+        "Qdrant query: %d prefetch branches, retrieve_k=%d",
+        len(prefetches),
+        RETRIEVE_K,
+    )
+
+    response = await client.query_points(
+        collection_name=QDRANT_COLLECTION_NAME,
+        prefetch=prefetches,
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        limit=RETRIEVE_K,
+        with_payload=True,
+    )
+
+    if not response.points:
+        return None
+
+    return response.points
+
+
+def extract_message_ids(point: Any) -> list[str]:
+    payload = point.payload or {}
+    metadata = payload.get("metadata") or {}
+    message_ids = metadata.get("message_ids") or []
+    return [str(mid) for mid in message_ids]
+
+
+async def get_rerank_scores(
+    client: httpx.AsyncClient,
+    label: str,
+    targets: list[str],
+) -> list[float]:
+    if not targets:
+        return []
+
+    response = await client.post(
+        RERANKER_URL,
+        **get_upstream_request_kwargs(),
+        json={
+            "model": RERANKER_MODEL,
+            "encoding_format": "float",
+            "text_1": label,
+            "text_2": targets,
+        },
+    )
+    response.raise_for_status()
+    data = response.json().get("data") or []
+    return [float(sample["score"]) for sample in data]
+
+
+async def rerank_points(
+    client: httpx.AsyncClient,
+    question: Question,
+    points: list[Any],
+) -> list[Any]:
+    # Двухэтапное реранжирование:
+
+    rerank_candidates = points[:RERANK_LIMIT]
+    tail = points[RERANK_LIMIT:]
+
+    # Для реранка берём search_text если есть — он содержательнее
+    rerank_query = (
+        question.search_text.strip()
+        if question.search_text.strip()
+        else question.text.strip()
+    )
+
+    rerank_targets = [
+        (point.payload or {}).get("page_content") or "" for point in rerank_candidates
+    ]
+    scores = await get_rerank_scores(client, rerank_query, rerank_targets)
+
+    reranked = [
+        point
+        for _, point in sorted(
+            zip(scores, rerank_candidates, strict=True),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+    ]
+
+    logger.info(
+        "Rerank: top=%d score=%.4f, bottom=%d score=%.4f",
+        1, max(scores) if scores else 0,
+        len(scores), min(scores) if scores else 0,
+    )
+
+    return reranked + tail
 
 
 @app.get("/health")
@@ -357,66 +398,78 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/index", response_model=IndexAPIResponse)
-async def index(payload: IndexAPIRequest) -> IndexAPIResponse:
-    return IndexAPIResponse(
-        results=build_chunks(
-            payload.data.chat,
-            payload.data.overlap_messages,
-            payload.data.new_messages,
-        )
+@app.post("/search", response_model=SearchAPIResponse)
+async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
+    question = payload.question
+    original_text = question.text.strip()
+
+    if not original_text:
+        raise HTTPException(status_code=400, detail="question.text is required")
+
+    http: httpx.AsyncClient = app.state.http
+    qdrant: AsyncQdrantClient = app.state.qdrant
+
+    dense_query = build_dense_query(question)
+    sparse_query_branches = build_sparse_queries(question)
+
+    # API-вызов (rate limit)
+    dense_vector = await embed_dense(http, dense_query)
+
+    # Sparse: батчем через локальную модель (все тексты за один проход)
+    sparse_texts = [text for _, text, _ in sparse_query_branches]
+    sparse_vectors = embed_sparse_texts(sparse_texts)
+
+    sparse_branches = [
+        (name, vec, limit)
+        for (name, _, limit), vec in zip(sparse_query_branches, sparse_vectors)
+    ]
+
+    # Multi-branch retrieval
+    best_points = await qdrant_search(qdrant, dense_vector, sparse_branches)
+
+    if best_points is None:
+        logger.info("No points found for: %r", original_text)
+        return SearchAPIResponse(results=[])
+
+    logger.info("Retrieved %d candidate points", len(best_points))
+
+    # Two-stage reranking
+    best_points = await rerank_points(http, question, list(best_points))
+
+    # Сборка message_ids с дедупликацией
+    # Порядок важен для nDCG: реранкнутые чанки идут первыми.
+    # Каждый чанк содержит несколько message_ids — все попадают в ответ.
+    seen: set[str] = set()
+    message_ids: list[str] = []
+    for point in best_points:
+        for mid in extract_message_ids(point):
+            if mid not in seen:
+                seen.add(mid)
+                message_ids.append(mid)
+
+    logger.info("Returning %d unique message_ids", len(message_ids))
+
+    return SearchAPIResponse(
+        results=[SearchAPIItem(message_ids=message_ids)]
     )
-
-
-@lru_cache(maxsize=1)
-def get_sparse_model():
-    from fastembed import SparseTextEmbedding
-
-    logger.info(
-        "Loading sparse model %s from cache %s",
-        SPARSE_MODEL_NAME,
-        FASTEMBED_CACHE_PATH,
-    )
-    return SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
-
-
-def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
-    model = get_sparse_model()
-    vectors: list[SparseVector] = []
-    for item in model.embed(texts):
-        vectors.append(
-            SparseVector(
-                indices=item.indices.tolist(),
-                values=item.values.tolist(),
-            )
-        )
-    return vectors
-
-
-@app.post("/sparse_embedding")
-async def sparse_embedding(payload: SparseEmbeddingRequest) -> dict[str, Any]:
-    vectors = await asyncio.to_thread(embed_sparse_texts, payload.texts)
-    return {"vectors": vectors}
 
 
 @app.exception_handler(Exception)
 async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception(exc)
+    detail = str(exc) or repr(exc)
+
     if isinstance(exc, RequestValidationError):
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
-    return JSONResponse(status_code=500, content={"detail": str(exc)})
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return JSONResponse(status_code=500, content={"detail": detail})
 
 
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(
-        "main:app",
-        host=HOST,
-        port=PORT,
-        reload=False,
-        workers=UVICORN_WORKERS,
-    )
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
 
 
 if __name__ == "__main__":
