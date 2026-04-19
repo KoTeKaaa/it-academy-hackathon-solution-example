@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ from qdrant_client import AsyncQdrantClient, models
 
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
+# Ваш сервис должен считывать эти переменные из окружения (env), так как проверяющая система управляет ими
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8003"))
 
@@ -28,11 +30,7 @@ OPEN_API_LOGIN = os.getenv("OPEN_API_LOGIN")
 OPEN_API_PASSWORD = os.getenv("OPEN_API_PASSWORD")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "evaluation")
-REQUIRED_ENV_VARS = [
-    "EMBEDDINGS_DENSE_URL",
-    "RERANKER_URL",
-    "QDRANT_URL",
-]
+REQUIRED_ENV_VARS = ["EMBEDDINGS_DENSE_URL", "RERANKER_URL", "QDRANT_URL"]
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
@@ -41,37 +39,28 @@ logger = logging.getLogger("search-service")
 def validate_required_env() -> None:
     if bool(OPEN_API_LOGIN) != bool(OPEN_API_PASSWORD):
         raise RuntimeError("OPEN_API_LOGIN and OPEN_API_PASSWORD must be set together")
-
     if not API_KEY and not (OPEN_API_LOGIN and OPEN_API_PASSWORD):
         raise RuntimeError("Either API_KEY or OPEN_API_LOGIN and OPEN_API_PASSWORD must be set")
-
-    missing_env_vars = [
-        name for name in REQUIRED_ENV_VARS if os.getenv(name) is None or os.getenv(name) == ""
-    ]
-    if not missing_env_vars:
-        return
-
-    logger.error("Empty required env vars: %s", ", ".join(missing_env_vars))
-    raise RuntimeError(f"Empty required env vars: {', '.join(missing_env_vars)}")
+    missing = [n for n in REQUIRED_ENV_VARS if not os.getenv(n)]
+    if missing:
+        logger.error("Empty required env vars: %s", ", ".join(missing))
+        raise RuntimeError(f"Empty required env vars: {', '.join(missing)}")
 
 
 validate_required_env()
 
-
 def get_upstream_request_kwargs() -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     kwargs: dict[str, Any] = {"headers": headers}
-
     if OPEN_API_LOGIN and OPEN_API_PASSWORD:
         kwargs["auth"] = (OPEN_API_LOGIN, OPEN_API_PASSWORD)
         return kwargs
-
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
-
     return kwargs
 
 
+# Модель данных, которую мы предоставляем и рассчитываем получать от вас
 class DateRange(BaseModel):
     from_: str = Field(alias="from")
     to: str
@@ -124,9 +113,10 @@ class SparseVector(BaseModel):
     values: list[float] = Field(default_factory=list)
 
 
+# Метадата чанков в Qdrant'e, по которой вы можете фильтровать
 class ChunkMetadata(BaseModel):
     chat_name: str
-    chat_type: str
+    chat_type: str # channel, group, private, thread
     chat_id: str
     chat_sn: str
     thread_sn: str | None = None
@@ -137,6 +127,18 @@ class ChunkMetadata(BaseModel):
     mentions: list[str] = Field(default_factory=list)
     contains_forward: bool = False
     contains_quote: bool = False
+
+
+DENSE_PREFETCH_K = 20
+SPARSE_MAIN_K = 50
+SPARSE_KEYWORDS_K = 40
+SPARSE_VARIANT_K = 30
+SPARSE_HYDE_K = 30
+SPARSE_ORIGINAL_K = 35
+RETRIEVE_K = 80
+RERANK_LIMIT = 20
+DENSE_QUERY_MAX_CHARS = 512
+HYDE_MAX_CHARS = 600
 
 
 @lru_cache(maxsize=1)
@@ -156,44 +158,14 @@ async def lifespan(app: FastAPI):
         await app.state.qdrant.close()
 
 
-app = FastAPI(title="Search Service", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Search Service", version="0.6.0", lifespan=lifespan)
 
-# ── Параметры retrieval ──────────────────────────────────────────────────────
-#
-# Стратегия: Multi-Sparse Prefetch + Two-Stage Rerank
-#
-# Dense (1 API-вызов, тарифицируется):
-#   └─ 1 prefetch ветка, ловит семантическую близость
-#
-# Sparse BM25 (локально, бесплатно, N веток):
-#   ├─ main_enriched  — основной запрос + keywords + entities
-#   ├─ keywords_only  — чистый лексический матч по ключевым словам
-#   ├─ variant_0      — альтернативная формулировка вопроса
-#   ├─ variant_1      — ещё одна формулировка
-#   └─ hyde_0         — первая строка гипотетического документа
-#
-# Все ветки сливаются Qdrant-RRF → широкий пул кандидатов.
-# Реранкер финально сортирует топ-N по семантической релевантности.
-#
-DENSE_PREFETCH_K = 20       # кандидатов от dense-ветки
 
-# Лимиты для каждой sparse-ветки (разные, т.к. разная точность источника)
-SPARSE_MAIN_K = 50          # основной обогащённый запрос — самый надёжный
-SPARSE_KEYWORDS_K = 40      # только ключевые слова — высокая точность терминов
-SPARSE_VARIANT_K = 30       # варианты вопроса — расширяют лексику
-SPARSE_HYDE_K = 25          # первая строка HyDE — гипотетический ответ
-
-RETRIEVE_K = 60             # итоговый пул после RRF (больше = выше Recall@50)
-RERANK_LIMIT = 20           # реранкер видит топ-20 → хороший nDCG
-
-DENSE_QUERY_MAX_CHARS = 512
-
+# Внутри шаблона dense и rerank берутся из внешних HTTP endpoint'ов,
+# которые предоставляет проверяющая система.
+# Текущий код ниже — минимальный пример search pipeline.
 
 def build_dense_query(question: Question) -> str:
-    """
-    Один компактный текст для dense embedding.
-    Ровно 1 HTTP-запрос к API на вопрос — rate limit соблюдён.
-    """
     base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
 
     entity_tokens: list[str] = []
@@ -213,19 +185,10 @@ def build_dense_query(question: Question) -> str:
 
 
 def build_sparse_queries(question: Question) -> list[tuple[str, str, int]]:
-    """
-    Возвращает список (name, text, prefetch_limit) для каждой sparse-ветки.
-    Все вычисляются локально — rate limit не затрагивается.
+    original_text = question.text.strip()
+    search_text = question.search_text.strip()
+    base = search_text if search_text else original_text
 
-    Принцип каждой ветки:
-      main_enriched — широкий охват: base + keywords + entities + date_mentions
-      keywords_only — точный терминологический матч без «шума» вопроса
-      variant_N     — альтернативные формулировки от препроцессора вопросов
-      hyde_0        — первая строка гипотетического документа-ответа
-    """
-    base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
-
-    # Собираем переиспользуемые части
     entity_tokens: list[str] = []
     if question.entities:
         for field in (question.entities.people, question.entities.names, question.entities.documents):
@@ -237,7 +200,6 @@ def build_sparse_queries(question: Question) -> list[tuple[str, str, int]]:
 
     branches: list[tuple[str, str, int]] = []
 
-    # main enriched
     main_parts = [base]
     if keyword_str:
         main_parts.append(keyword_str)
@@ -247,35 +209,37 @@ def build_sparse_queries(question: Question) -> list[tuple[str, str, int]]:
         main_parts.append(date_str)
     branches.append(("main_enriched", "\n".join(filter(None, main_parts)), SPARSE_MAIN_K))
 
-    # keywords only
-    # Если keywords нет — строим из entities, чтобы ветка не пустовала
+    if search_text and search_text != original_text:
+        orig_parts = [original_text]
+        if keyword_str:
+            orig_parts.append(keyword_str)
+        if entity_tokens:
+            orig_parts.append(" ".join(entity_tokens))
+        branches.append(("original_text", "\n".join(filter(None, orig_parts)), SPARSE_ORIGINAL_K))
+
     keywords_text = " ".join(filter(None, [keyword_str, " ".join(entity_tokens)]))
     if keywords_text.strip():
         branches.append(("keywords_only", keywords_text, SPARSE_KEYWORDS_K))
 
-    # варианты вопроса
     if question.variants:
-        for i, variant in enumerate(question.variants[:2]):
+        for i, variant in enumerate(question.variants[:3]):
             v = variant.strip()
             if v:
-                # Обогащаем вариант keywords для лучшего покрытия
                 v_text = f"{v}\n{keyword_str}" if keyword_str else v
                 branches.append((f"variant_{i}", v_text, SPARSE_VARIANT_K))
 
-    # HyDE первая строка
     if question.hyde:
-        first_line = question.hyde[0].strip().split("\n")[0][:300]
-        if first_line:
-            branches.append(("hyde_0", first_line, SPARSE_HYDE_K))
+        for i, h in enumerate(question.hyde[:2]):
+            full_hyde = h.strip()[:HYDE_MAX_CHARS]
+            if full_hyde:
+                branches.append((f"hyde_{i}", full_hyde, SPARSE_HYDE_K))
 
-    logger.info(
-        "Sparse branches: %s",
-        [(name, len(text), k) for name, text, k in branches],
-    )
+    logger.info("Sparse branches: %s", [(n, len(t), k) for n, t, k in branches])
     return branches
 
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
+    # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
     response = await client.post(
         EMBEDDINGS_DENSE_URL,
         **get_upstream_request_kwargs(),
@@ -291,8 +255,7 @@ async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     return payload.data[0].embedding
 
 
-def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
-    "Батчевый sparse embedding — один вызов модели для всех текстов."
+def _embed_sparse_texts_sync(texts: list[str]) -> list[SparseVector]:
     model = get_sparse_model()
     result: list[SparseVector] = []
     for item in model.embed(texts):
@@ -305,38 +268,23 @@ def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
     return result
 
 
+async def embed_sparse_batch(texts: list[str]) -> list[SparseVector]:
+    return await asyncio.to_thread(_embed_sparse_texts_sync, texts)
+
+
 async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
-    sparse_branches: list[tuple[str, SparseVector, int]],  # (name, vector, limit)
+    sparse_branches: list[tuple[str, SparseVector, int]],
 ) -> list[Any] | None:
-    """
-    Multi-branch hybrid search.
-
-    Схема prefetch:
-      [dense_main] + [sparse_main] + [sparse_keywords] + [sparse_variant_0]
-                  + [sparse_variant_1] + [sparse_hyde_0]
-                          │
-                    RRF fusion (Qdrant)
-                          │
-                    top-RETRIEVE_K кандидатов
-
-    Больше веток = больше разнообразия кандидатов = выше Recall@50.
-    Каждая ветка независимо ловит чанки, которые другие могут пропустить.
-    """
-    prefetches: list[models.Prefetch] = []
-
-    # Dense ветка (1 штука — rate limit)
-    prefetches.append(
+    prefetches: list[models.Prefetch] = [
         models.Prefetch(
             query=dense_vector,
             using=QDRANT_DENSE_VECTOR_NAME,
             limit=DENSE_PREFETCH_K,
         )
-    )
-
-    # Sparse ветки (N штук — все локальные)
-    for name, sparse_vec, limit in sparse_branches:
+    ]
+    for _name, sparse_vec, limit in sparse_branches:
         prefetches.append(
             models.Prefetch(
                 query=models.SparseVector(
@@ -348,11 +296,7 @@ async def qdrant_search(
             )
         )
 
-    logger.info(
-        "Qdrant query: %d prefetch branches, retrieve_k=%d",
-        len(prefetches),
-        RETRIEVE_K,
-    )
+    logger.info("Qdrant query: %d prefetch branches, retrieve_k=%d", len(prefetches), RETRIEVE_K)
 
     response = await client.query_points(
         collection_name=QDRANT_COLLECTION_NAME,
@@ -361,18 +305,13 @@ async def qdrant_search(
         limit=RETRIEVE_K,
         with_payload=True,
     )
-
-    if not response.points:
-        return None
-
-    return response.points
+    return response.points if response.points else None
 
 
 def extract_message_ids(point: Any) -> list[str]:
     payload = point.payload or {}
     metadata = payload.get("metadata") or {}
-    message_ids = metadata.get("message_ids") or []
-    return [str(mid) for mid in message_ids]
+    return [str(mid) for mid in (metadata.get("message_ids") or [])]
 
 
 async def get_rerank_scores(
@@ -382,7 +321,7 @@ async def get_rerank_scores(
 ) -> list[float]:
     if not targets:
         return []
-
+    # Rerank endpoint возвращает score для пары query -> candidate text.
     response = await client.post(
         RERANKER_URL,
         **get_upstream_request_kwargs(),
@@ -403,34 +342,13 @@ async def rerank_points(
     question: Question,
     points: list[Any],
 ) -> list[Any]:
-    """
-    Двухэтапное реранжирование:
-
-    Этап 1 — Reranker API (топ-RERANK_LIMIT кандидатов):
-      Семантическая оценка пары (вопрос, текст чанка).
-      Используем search_text если есть — он точнее сформулирован.
-      Результат: лучшие чанки всплывают наверх → хороший nDCG.
-
-    Этап 2 — Хвост (остальные кандидаты):
-      Добавляем в конец в порядке RRF-скора из Qdrant.
-      Они не потеряны — влияют на Recall@50 через свои message_ids.
-
-    Итоговый порядок: [reranked_top] + [rrf_tail]
-    """
     rerank_candidates = points[:RERANK_LIMIT]
     tail = points[RERANK_LIMIT:]
 
-    # Для реранка берём search_text если есть — он содержательнее
-    rerank_query = (
-        question.search_text.strip()
-        if question.search_text.strip()
-        else question.text.strip()
-    )
+    rerank_query = question.text.strip()
 
-    rerank_targets = [
-        (point.payload or {}).get("page_content") or "" for point in rerank_candidates
-    ]
-    scores = await get_rerank_scores(client, rerank_query, rerank_targets)
+    targets = [(point.payload or {}).get("page_content") or "" for point in rerank_candidates]
+    scores = await get_rerank_scores(client, rerank_query, targets)
 
     reranked = [
         point
@@ -441,15 +359,13 @@ async def rerank_points(
         )
     ]
 
-    logger.info(
-        "Rerank: top=%d score=%.4f, bottom=%d score=%.4f",
-        1, max(scores) if scores else 0,
-        len(scores), min(scores) if scores else 0,
-    )
+    if scores:
+        logger.info("Rerank scores: max=%.4f min=%.4f", max(scores), min(scores))
 
     return reranked + tail
 
 
+# Ваш сервис должен имплементировать оба этих метода
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -458,9 +374,7 @@ async def health() -> dict[str, str]:
 @app.post("/search", response_model=SearchAPIResponse)
 async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     question = payload.question
-    original_text = question.text.strip()
-
-    if not original_text:
+    if not question.text.strip():
         raise HTTPException(status_code=400, detail="question.text is required")
 
     http: httpx.AsyncClient = app.state.http
@@ -469,33 +383,26 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     dense_query = build_dense_query(question)
     sparse_query_branches = build_sparse_queries(question)
 
-    # API-вызов (rate limit)
     dense_vector = await embed_dense(http, dense_query)
 
-    # Sparse: батчем через локальную модель (все тексты за один проход)
     sparse_texts = [text for _, text, _ in sparse_query_branches]
-    sparse_vectors = embed_sparse_texts(sparse_texts)
+    sparse_vectors = await embed_sparse_batch(sparse_texts)
 
     sparse_branches = [
         (name, vec, limit)
         for (name, _, limit), vec in zip(sparse_query_branches, sparse_vectors)
     ]
 
-    # Multi-branch retrieval
     best_points = await qdrant_search(qdrant, dense_vector, sparse_branches)
 
     if best_points is None:
-        logger.info("No points found for: %r", original_text)
+        logger.info("No points found for: %r", question.text.strip())
         return SearchAPIResponse(results=[])
 
     logger.info("Retrieved %d candidate points", len(best_points))
 
-    # Two-stage reranking
     best_points = await rerank_points(http, question, list(best_points))
 
-    # Сборка message_ids с дедупликацией
-    # Порядок важен для nDCG: реранкнутые чанки идут первыми.
-    # Каждый чанк содержит несколько message_ids — все попадают в ответ.
     seen: set[str] = set()
     message_ids: list[str] = []
     for point in best_points:
@@ -506,16 +413,13 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
 
     logger.info("Returning %d unique message_ids", len(message_ids))
 
-    return SearchAPIResponse(
-        results=[SearchAPIItem(message_ids=message_ids)]
-    )
+    return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
 
 
 @app.exception_handler(Exception)
 async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception(exc)
     detail = str(exc) or repr(exc)
-
     if isinstance(exc, RequestValidationError):
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
     if isinstance(exc, HTTPException):
@@ -525,7 +429,6 @@ async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
 
 def main() -> None:
     import uvicorn
-
     uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
 
 
