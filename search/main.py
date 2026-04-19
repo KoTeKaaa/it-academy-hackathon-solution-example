@@ -72,8 +72,6 @@ def get_upstream_request_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-# ── Модели данных ────────────────────────────────────────────────────────────
-
 class DateRange(BaseModel):
     from_: str = Field(alias="from")
     to: str
@@ -158,32 +156,43 @@ async def lifespan(app: FastAPI):
         await app.state.qdrant.close()
 
 
-app = FastAPI(title="Search Service", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Search Service", version="0.5.0", lifespan=lifespan)
 
 # ── Параметры retrieval ──────────────────────────────────────────────────────
-# Recall@50 — главная метрика (80% веса).
-# Широкая воронка = больше шансов поймать нужные чанки до реранка.
-DENSE_PREFETCH_K = 20      # было 15
-SPARSE_PREFETCH_K = 50     # было 40
-RETRIEVE_K = 40            # было 30; итоговый пул после RRF
-RERANK_LIMIT = 15          # было 10; больше кандидатов → лучше nDCG
+#
+# Стратегия: Multi-Sparse Prefetch + Two-Stage Rerank
+#
+# Dense (1 API-вызов, тарифицируется):
+#   └─ 1 prefetch ветка, ловит семантическую близость
+#
+# Sparse BM25 (локально, бесплатно, N веток):
+#   ├─ main_enriched  — основной запрос + keywords + entities
+#   ├─ keywords_only  — чистый лексический матч по ключевым словам
+#   ├─ variant_0      — альтернативная формулировка вопроса
+#   ├─ variant_1      — ещё одна формулировка
+#   └─ hyde_0         — первая строка гипотетического документа
+#
+# Все ветки сливаются Qdrant-RRF → широкий пул кандидатов.
+# Реранкер финально сортирует топ-N по семантической релевантности.
+#
+DENSE_PREFETCH_K = 20       # кандидатов от dense-ветки
 
-# Жёсткий лимит символов для dense-запроса (один вызов на вопрос)
+# Лимиты для каждой sparse-ветки (разные, т.к. разная точность источника)
+SPARSE_MAIN_K = 50          # основной обогащённый запрос — самый надёжный
+SPARSE_KEYWORDS_K = 40      # только ключевые слова — высокая точность терминов
+SPARSE_VARIANT_K = 30       # варианты вопроса — расширяют лексику
+SPARSE_HYDE_K = 25          # первая строка HyDE — гипотетический ответ
+
+RETRIEVE_K = 60             # итоговый пул после RRF (больше = выше Recall@50)
+RERANK_LIMIT = 20           # реранкер видит топ-20 → хороший nDCG
+
 DENSE_QUERY_MAX_CHARS = 512
 
 
-# ── Построение запросов ──────────────────────────────────────────────────────
-
 def build_dense_query(question: Question) -> str:
     """
-    Один компактный текст для dense embedding — ровно 1 API-вызов на вопрос.
-
-    Состав:
-      - search_text (если есть) или text — семантический смысл вопроса
-      - entity names/people — критично для «Кто руководит X?»
-
-    HyDE и variants здесь не нужны: они длинные, дорогие по символам,
-    и их ценность полностью покрывается богатым sparse-запросом.
+    Один компактный текст для dense embedding.
+    Ровно 1 HTTP-запрос к API на вопрос — rate limit соблюдён.
     """
     base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
 
@@ -203,57 +212,68 @@ def build_dense_query(question: Question) -> str:
     return combined
 
 
-def build_sparse_query(question: Question) -> str:
+def build_sparse_queries(question: Question) -> list[tuple[str, str, int]]:
     """
-    Богатый текст для BM25 — локальная модель, rate limit не расходуется.
+    Возвращает список (name, text, prefetch_limit) для каждой sparse-ветки.
+    Все вычисляются локально — rate limit не затрагивается.
 
-    Включаем всё доступное:
-      - base text / search_text
-      - keywords — золото для точного лексического матча
-      - entity names, documents
-      - варианты вопроса (расширяют словарный охват)
-      - первые строки HyDE-документов (суть без объёма)
-      - date_mentions — для запросов с датами
+    Принцип каждой ветки:
+      main_enriched — широкий охват: base + keywords + entities + date_mentions
+      keywords_only — точный терминологический матч без «шума» вопроса
+      variant_N     — альтернативные формулировки от препроцессора вопросов
+      hyde_0        — первая строка гипотетического документа-ответа
     """
-    parts: list[str] = []
-
     base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
-    parts.append(base)
 
-    if question.keywords:
-        parts.append(" ".join(question.keywords))
-
+    # Собираем переиспользуемые части
+    entity_tokens: list[str] = []
     if question.entities:
-        entity_tokens: list[str] = []
-        if question.entities.people:
-            entity_tokens.extend(question.entities.people)
-        if question.entities.names:
-            entity_tokens.extend(question.entities.names)
-        if question.entities.documents:
-            entity_tokens.extend(question.entities.documents)
-        if entity_tokens:
-            parts.append(" ".join(entity_tokens))
+        for field in (question.entities.people, question.entities.names, question.entities.documents):
+            if field:
+                entity_tokens.extend(field)
 
+    keyword_str = " ".join(question.keywords) if question.keywords else ""
+    date_str = " ".join(question.date_mentions) if question.date_mentions else ""
+
+    branches: list[tuple[str, str, int]] = []
+
+    # main enriched
+    main_parts = [base]
+    if keyword_str:
+        main_parts.append(keyword_str)
+    if entity_tokens:
+        main_parts.append(" ".join(entity_tokens))
+    if date_str:
+        main_parts.append(date_str)
+    branches.append(("main_enriched", "\n".join(filter(None, main_parts)), SPARSE_MAIN_K))
+
+    # keywords only
+    # Если keywords нет — строим из entities, чтобы ветка не пустовала
+    keywords_text = " ".join(filter(None, [keyword_str, " ".join(entity_tokens)]))
+    if keywords_text.strip():
+        branches.append(("keywords_only", keywords_text, SPARSE_KEYWORDS_K))
+
+    # варианты вопроса
     if question.variants:
-        for v in question.variants[:3]:
-            parts.append(v.strip())
+        for i, variant in enumerate(question.variants[:2]):
+            v = variant.strip()
+            if v:
+                # Обогащаем вариант keywords для лучшего покрытия
+                v_text = f"{v}\n{keyword_str}" if keyword_str else v
+                branches.append((f"variant_{i}", v_text, SPARSE_VARIANT_K))
 
-    # Только первая строка HyDE — суть без длинного тела
+    # HyDE первая строка
     if question.hyde:
-        for h in question.hyde[:3]:
-            first_line = h.strip().split("\n")[0][:200]
-            if first_line:
-                parts.append(first_line)
+        first_line = question.hyde[0].strip().split("\n")[0][:300]
+        if first_line:
+            branches.append(("hyde_0", first_line, SPARSE_HYDE_K))
 
-    if question.date_mentions:
-        parts.append(" ".join(question.date_mentions))
+    logger.info(
+        "Sparse branches: %s",
+        [(name, len(text), k) for name, text, k in branches],
+    )
+    return branches
 
-    combined = "\n".join(filter(None, parts))
-    logger.info("Sparse query (%d chars): %r", len(combined), combined[:120])
-    return combined
-
-
-# ── Embedding ────────────────────────────────────────────────────────────────
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     response = await client.post(
@@ -271,46 +291,72 @@ async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     return payload.data[0].embedding
 
 
-async def embed_sparse(text: str) -> SparseVector:
-    vectors = list(get_sparse_model().embed([text]))
-    if not vectors:
-        raise ValueError("Sparse embedding response is empty")
-    item = vectors[0]
-    return SparseVector(
-        indices=[int(i) for i in item.indices.tolist()],
-        values=[float(v) for v in item.values.tolist()],
-    )
+def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
+    "Батчевый sparse embedding — один вызов модели для всех текстов."
+    model = get_sparse_model()
+    result: list[SparseVector] = []
+    for item in model.embed(texts):
+        result.append(
+            SparseVector(
+                indices=[int(i) for i in item.indices.tolist()],
+                values=[float(v) for v in item.values.tolist()],
+            )
+        )
+    return result
 
-
-# ── Qdrant search ────────────────────────────────────────────────────────────
 
 async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
-    sparse_vector: SparseVector,
+    sparse_branches: list[tuple[str, SparseVector, int]],  # (name, vector, limit)
 ) -> list[Any] | None:
     """
-    Hybrid search: dense + sparse prefetch, слияние через RRF.
-    Фильтры по метадате намеренно не применяются — неизвестный формат
-    полей в Qdrant может обнулить Recall для целых категорий вопросов.
+    Multi-branch hybrid search.
+
+    Схема prefetch:
+      [dense_main] + [sparse_main] + [sparse_keywords] + [sparse_variant_0]
+                  + [sparse_variant_1] + [sparse_hyde_0]
+                          │
+                    RRF fusion (Qdrant)
+                          │
+                    top-RETRIEVE_K кандидатов
+
+    Больше веток = больше разнообразия кандидатов = выше Recall@50.
+    Каждая ветка независимо ловит чанки, которые другие могут пропустить.
     """
-    response = await client.query_points(
-        collection_name=QDRANT_COLLECTION_NAME,
-        prefetch=[
-            models.Prefetch(
-                query=dense_vector,
-                using=QDRANT_DENSE_VECTOR_NAME,
-                limit=DENSE_PREFETCH_K,
-            ),
+    prefetches: list[models.Prefetch] = []
+
+    # Dense ветка (1 штука — rate limit)
+    prefetches.append(
+        models.Prefetch(
+            query=dense_vector,
+            using=QDRANT_DENSE_VECTOR_NAME,
+            limit=DENSE_PREFETCH_K,
+        )
+    )
+
+    # Sparse ветки (N штук — все локальные)
+    for name, sparse_vec, limit in sparse_branches:
+        prefetches.append(
             models.Prefetch(
                 query=models.SparseVector(
-                    indices=sparse_vector.indices,
-                    values=sparse_vector.values,
+                    indices=sparse_vec.indices,
+                    values=sparse_vec.values,
                 ),
                 using=QDRANT_SPARSE_VECTOR_NAME,
-                limit=SPARSE_PREFETCH_K,
-            ),
-        ],
+                limit=limit,
+            )
+        )
+
+    logger.info(
+        "Qdrant query: %d prefetch branches, retrieve_k=%d",
+        len(prefetches),
+        RETRIEVE_K,
+    )
+
+    response = await client.query_points(
+        collection_name=QDRANT_COLLECTION_NAME,
+        prefetch=prefetches,
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
@@ -321,8 +367,6 @@ async def qdrant_search(
 
     return response.points
 
-
-# ── Reranking ────────────────────────────────────────────────────────────────
 
 def extract_message_ids(point: Any) -> list[str]:
     payload = point.payload or {}
@@ -356,19 +400,37 @@ async def get_rerank_scores(
 
 async def rerank_points(
     client: httpx.AsyncClient,
-    query: str,
+    question: Question,
     points: list[Any],
 ) -> list[Any]:
     """
-    Реранжируем топ-RERANK_LIMIT кандидатов.
-    Используем оригинальный question.text — он чище для семантической оценки.
-    Остальные кандидаты добавляем в конец (они всё ещё влияют на Recall@50).
+    Двухэтапное реранжирование:
+
+    Этап 1 — Reranker API (топ-RERANK_LIMIT кандидатов):
+      Семантическая оценка пары (вопрос, текст чанка).
+      Используем search_text если есть — он точнее сформулирован.
+      Результат: лучшие чанки всплывают наверх → хороший nDCG.
+
+    Этап 2 — Хвост (остальные кандидаты):
+      Добавляем в конец в порядке RRF-скора из Qdrant.
+      Они не потеряны — влияют на Recall@50 через свои message_ids.
+
+    Итоговый порядок: [reranked_top] + [rrf_tail]
     """
     rerank_candidates = points[:RERANK_LIMIT]
     tail = points[RERANK_LIMIT:]
 
-    rerank_targets = [point.payload.get("page_content") for point in rerank_candidates]
-    scores = await get_rerank_scores(client, query, rerank_targets)
+    # Для реранка берём search_text если есть — он содержательнее
+    rerank_query = (
+        question.search_text.strip()
+        if question.search_text.strip()
+        else question.text.strip()
+    )
+
+    rerank_targets = [
+        (point.payload or {}).get("page_content") or "" for point in rerank_candidates
+    ]
+    scores = await get_rerank_scores(client, rerank_query, rerank_targets)
 
     reranked = [
         point
@@ -379,10 +441,14 @@ async def rerank_points(
         )
     ]
 
+    logger.info(
+        "Rerank: top=%d score=%.4f, bottom=%d score=%.4f",
+        1, max(scores) if scores else 0,
+        len(scores), min(scores) if scores else 0,
+    )
+
     return reranked + tail
 
-
-# ── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health() -> dict[str, str]:
@@ -400,24 +466,36 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     http: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    # 1. Строим запросы
-    dense_query = build_dense_query(question)    # компактный, 1 API-вызов
-    sparse_query = build_sparse_query(question)  # богатый, локально
+    dense_query = build_dense_query(question)
+    sparse_query_branches = build_sparse_queries(question)
 
-    # 2. Embeddings
+    # API-вызов (rate limit)
     dense_vector = await embed_dense(http, dense_query)
-    sparse_vector = await embed_sparse(sparse_query)
 
-    # 3. Retrieval (без фильтров — максимальный Recall)
-    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector)
+    # Sparse: батчем через локальную модель (все тексты за один проход)
+    sparse_texts = [text for _, text, _ in sparse_query_branches]
+    sparse_vectors = embed_sparse_texts(sparse_texts)
+
+    sparse_branches = [
+        (name, vec, limit)
+        for (name, _, limit), vec in zip(sparse_query_branches, sparse_vectors)
+    ]
+
+    # Multi-branch retrieval
+    best_points = await qdrant_search(qdrant, dense_vector, sparse_branches)
 
     if best_points is None:
+        logger.info("No points found for: %r", original_text)
         return SearchAPIResponse(results=[])
 
-    # 4. Rerank по оригинальному вопросу
-    best_points = await rerank_points(http, original_text, list(best_points))
+    logger.info("Retrieved %d candidate points", len(best_points))
 
-    # 5. Сборка message_ids с дедупликацией
+    # Two-stage reranking
+    best_points = await rerank_points(http, question, list(best_points))
+
+    # Сборка message_ids с дедупликацией
+    # Порядок важен для nDCG: реранкнутые чанки идут первыми.
+    # Каждый чанк содержит несколько message_ids — все попадают в ответ.
     seen: set[str] = set()
     message_ids: list[str] = []
     for point in best_points:
@@ -425,6 +503,8 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
             if mid not in seen:
                 seen.add(mid)
                 message_ids.append(mid)
+
+    logger.info("Returning %d unique message_ids", len(message_ids))
 
     return SearchAPIResponse(
         results=[SearchAPIItem(message_ids=message_ids)]

@@ -91,8 +91,6 @@ FASTEMBED_CACHE_PATH = "/models/fastembed"
 UVICORN_WORKERS = 8
 
 
-# ── Рендеринг сообщений ──────────────────────────────────────────────────────
-
 def render_message(message: Message) -> str:
     """Полный рендер для page_content — сохраняем структуру."""
     if message.is_hidden or message.is_system:
@@ -184,8 +182,6 @@ def truncate_content(text: str, max_chars: int = 4000) -> str:
     return truncated
 
 
-# ── Обогащение контента метаданными чата ────────────────────────────────────
-
 CHAT_TYPE_RU = {
     "channel": "канал",
     "group": "группа",
@@ -232,8 +228,6 @@ def enrich_sparse_content(
 
     return "\n".join(filter(None, extra_parts))
 
-
-# ── Построение чанков ────────────────────────────────────────────────────────
 
 def build_chunks(
     chat: Chat,
@@ -298,17 +292,15 @@ def build_chunks(
 
         chunk_messages = [message for _, _, _, message in chunk_body_ranges]
 
-        # ── Контент ─────────────────────────────────────────────────────────
-
         # page_content: заголовок чата + полный текст чанка
-        # Реранкер видит этот текст → заголовок помогает ему понять контекст
+        # Реранкер видит этот текст -> заголовок помогает ему понять контекст
         page_content = f"{header}\n{chunk_text}"
 
         # dense_content: заголовок + семантически богатый текст сообщений
         raw_dense = build_dense_chunk_text(chunk_messages)
         dense_content = f"{header}\n{truncate_content(raw_dense)}" if raw_dense else page_content
 
-        # sparse_content: добавляем chat.name, тип и упоминания → лексический охват
+        # sparse_content: добавляем chat.name, тип и упоминания -> лексический охват
         raw_sparse = build_sparse_chunk_text(chunk_messages)
         all_mentions: set[str] = set()
         for msg in chunk_messages:
@@ -321,7 +313,6 @@ def build_chunks(
             all_mentions,
         )
 
-        # ── Метаданные ──────────────────────────────────────────────────────
         participants = {msg.sender_id for msg in chunk_messages}
         has_forward = any(msg.is_forward for msg in chunk_messages)
         has_quote = any(msg.is_quote for msg in chunk_messages)
@@ -347,8 +338,6 @@ def build_chunks(
 
     return result
 
-
-# ── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health() -> dict[str, str]:
