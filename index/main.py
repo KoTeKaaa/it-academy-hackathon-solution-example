@@ -102,6 +102,8 @@ def render_message(message: Message) -> str:
         parts.append("[FORWARD]")
     if message.is_quote:
         parts.append("[QUOTE]")
+    if message.file_snippets:
+        parts.append(f"[FILE]\n{message.file_snippets}")
     if message.text:
         parts.append(message.text)
 
@@ -155,9 +157,25 @@ def _prepare_base_content(
 
     return "\n".join(filter(None, parts))
 
-
 def prepare_dense_content(message: Message) -> str:
-    return _prepare_base_content(message, forward_quote_limit=180, regular_part_limit=600)
+    if message.is_hidden or message.is_system:
+        return ""
+
+    parts: list[str] = []
+
+    if message.text:
+        parts.append(message.text)
+
+    if message.parts:
+        for part in message.parts:
+            if not isinstance(part, dict):
+                continue
+            part_text = part.get("text")
+            if not isinstance(part_text, str) or not part_text:
+                continue
+            parts.append(part_text[:600])
+
+    return "\n".join(filter(None, parts))
 
 
 def prepare_sparse_content(message: Message) -> str:
@@ -205,26 +223,29 @@ def enrich_sparse_content(
     base_sparse: str,
     chat: Chat,
     mentions: set[str],
+    has_forward: bool,
+    has_quote: bool,
 ) -> str:
     """
     Для BM25 добавляем:
     - название чата (точный матч по имени)
-    - тип чата
+    - сигналы о наличии forward/quote для фильтрации
     - упоминания (@-теги, имена) из сообщений
-
-    Это критично для вопросов:
-      «Кто руководит командой X?»  → mentions содержат имена
-      «Напишите в чат Go Nova»      → chat.name есть в запросе
     """
     extra_parts: list[str] = [base_sparse]
 
-    # Название и тип чата
+    # Название чата
     extra_parts.append(chat.name)
-    extra_parts.append(chat.type)
 
     # Упоминания — часто это имена людей или username'ы
     if mentions:
         extra_parts.append(" ".join(sorted(mentions)))
+
+    # Маркеры для поиска по типам контента
+    if has_forward:
+        extra_parts.append("forward")
+    if has_quote:
+        extra_parts.append("quote")
 
     return "\n".join(filter(None, extra_parts))
 
@@ -307,18 +328,20 @@ def build_chunks(
             if msg.mentions:
                 all_mentions.update(msg.mentions)
 
-        sparse_content = enrich_sparse_content(
-            truncate_content(raw_sparse) if raw_sparse else chunk_text,
-            chat,
-            all_mentions,
-        )
-
         participants = {msg.sender_id for msg in chunk_messages}
         has_forward = any(msg.is_forward for msg in chunk_messages)
         has_quote = any(msg.is_quote for msg in chunk_messages)
         chunk_timestamps = [msg.time for msg in chunk_messages if msg.time]
         date_start = min(chunk_timestamps) if chunk_timestamps else None
         date_end = max(chunk_timestamps) if chunk_timestamps else None
+
+        sparse_content = enrich_sparse_content(
+            truncate_content(raw_sparse) if raw_sparse else chunk_text,
+            chat,
+            all_mentions,
+            has_forward=has_forward,
+            has_quote=has_quote,
+        )
 
         result.append(
             IndexAPIItem(
@@ -348,7 +371,7 @@ async def health() -> dict[str, str]:
 async def index(payload: IndexAPIRequest) -> IndexAPIResponse:
     return IndexAPIResponse(
         results=build_chunks(
-            payload.data.chat,           # <-- передаём chat
+            payload.data.chat,
             payload.data.overlap_messages,
             payload.data.new_messages,
         )
