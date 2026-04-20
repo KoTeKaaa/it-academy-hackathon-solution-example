@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -29,12 +30,8 @@ OPEN_API_LOGIN = os.getenv("OPEN_API_LOGIN")
 OPEN_API_PASSWORD = os.getenv("OPEN_API_PASSWORD")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "evaluation")
-REQUIRED_ENV_VARS = [
-    "EMBEDDINGS_DENSE_URL",
-    "RERANKER_URL",
-    "QDRANT_URL",
-]
- 
+REQUIRED_ENV_VARS = ["EMBEDDINGS_DENSE_URL", "RERANKER_URL", "QDRANT_URL"]
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
 
@@ -42,34 +39,24 @@ logger = logging.getLogger("search-service")
 def validate_required_env() -> None:
     if bool(OPEN_API_LOGIN) != bool(OPEN_API_PASSWORD):
         raise RuntimeError("OPEN_API_LOGIN and OPEN_API_PASSWORD must be set together")
-
     if not API_KEY and not (OPEN_API_LOGIN and OPEN_API_PASSWORD):
         raise RuntimeError("Either API_KEY or OPEN_API_LOGIN and OPEN_API_PASSWORD must be set")
-
-    missing_env_vars = [
-        name for name in REQUIRED_ENV_VARS if os.getenv(name) is None or os.getenv(name) == ""
-    ]
-    if not missing_env_vars:
-        return
-
-    logger.error("Empty required env vars: %s", ", ".join(missing_env_vars))
-    raise RuntimeError(f"Empty required env vars: {', '.join(missing_env_vars)}")
+    missing = [n for n in REQUIRED_ENV_VARS if not os.getenv(n)]
+    if missing:
+        logger.error("Empty required env vars: %s", ", ".join(missing))
+        raise RuntimeError(f"Empty required env vars: {', '.join(missing)}")
 
 
 validate_required_env()
 
-
 def get_upstream_request_kwargs() -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     kwargs: dict[str, Any] = {"headers": headers}
-
     if OPEN_API_LOGIN and OPEN_API_PASSWORD:
         kwargs["auth"] = (OPEN_API_LOGIN, OPEN_API_PASSWORD)
         return kwargs
-
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
-
     return kwargs
 
 
@@ -126,9 +113,6 @@ class SparseVector(BaseModel):
     values: list[float] = Field(default_factory=list)
 
 
-class SparseEmbeddingResponse(BaseModel):
-    vectors: list[SparseVector]
-
 # Метадата чанков в Qdrant'e, по которой вы можете фильтровать
 class ChunkMetadata(BaseModel):
     chat_name: str
@@ -145,6 +129,18 @@ class ChunkMetadata(BaseModel):
     contains_quote: bool = False
 
 
+DENSE_PREFETCH_K = 20
+SPARSE_MAIN_K = 50
+SPARSE_KEYWORDS_K = 40
+SPARSE_VARIANT_K = 30
+SPARSE_HYDE_K = 30
+SPARSE_ORIGINAL_K = 35
+RETRIEVE_K = 80
+RERANK_LIMIT = 20
+DENSE_QUERY_MAX_CHARS = 512
+HYDE_MAX_CHARS = 600
+
+
 @lru_cache(maxsize=1)
 def get_sparse_model() -> SparseTextEmbedding:
     logger.info("Loading local sparse model %s", SPARSE_MODEL_NAME)
@@ -154,10 +150,7 @@ def get_sparse_model() -> SparseTextEmbedding:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient()
-    app.state.qdrant = AsyncQdrantClient(
-        url=QDRANT_URL,
-        api_key=API_KEY,
-    )
+    app.state.qdrant = AsyncQdrantClient(url=QDRANT_URL, api_key=API_KEY)
     try:
         yield
     finally:
@@ -165,16 +158,85 @@ async def lifespan(app: FastAPI):
         await app.state.qdrant.close()
 
 
-app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Search Service", version="0.6.0", lifespan=lifespan)
 
 
 # Внутри шаблона dense и rerank берутся из внешних HTTP endpoint'ов,
 # которые предоставляет проверяющая система.
 # Текущий код ниже — минимальный пример search pipeline.
-DENSE_PREFETCH_K = 10
-SPRASE_PREFETCH_K = 30
-RETRIEVE_K = 20
-RERANK_LIMIT = 10
+
+def build_dense_query(question: Question) -> str:
+    base = question.search_text.strip() if question.search_text.strip() else question.text.strip()
+
+    entity_tokens: list[str] = []
+    if question.entities:
+        if question.entities.people:
+            entity_tokens.extend(question.entities.people)
+        if question.entities.names:
+            entity_tokens.extend(question.entities.names)
+
+    combined = f"{base}\n{' '.join(entity_tokens)}" if entity_tokens else base
+
+    if len(combined) > DENSE_QUERY_MAX_CHARS:
+        combined = combined[:DENSE_QUERY_MAX_CHARS]
+
+    logger.info("Dense query (%d chars): %r", len(combined), combined[:120])
+    return combined
+
+
+def build_sparse_queries(question: Question) -> list[tuple[str, str, int]]:
+    original_text = question.text.strip()
+    search_text = question.search_text.strip()
+    base = search_text if search_text else original_text
+
+    entity_tokens: list[str] = []
+    if question.entities:
+        for field in (question.entities.people, question.entities.names, question.entities.documents):
+            if field:
+                entity_tokens.extend(field)
+
+    keyword_str = " ".join(question.keywords) if question.keywords else ""
+    date_str = " ".join(question.date_mentions) if question.date_mentions else ""
+
+    branches: list[tuple[str, str, int]] = []
+
+    main_parts = [base]
+    if keyword_str:
+        main_parts.append(keyword_str)
+    if entity_tokens:
+        main_parts.append(" ".join(entity_tokens))
+    if date_str:
+        main_parts.append(date_str)
+    branches.append(("main_enriched", "\n".join(filter(None, main_parts)), SPARSE_MAIN_K))
+
+    if search_text and search_text != original_text:
+        orig_parts = [original_text]
+        if keyword_str:
+            orig_parts.append(keyword_str)
+        if entity_tokens:
+            orig_parts.append(" ".join(entity_tokens))
+        branches.append(("original_text", "\n".join(filter(None, orig_parts)), SPARSE_ORIGINAL_K))
+
+    keywords_text = " ".join(filter(None, [keyword_str, " ".join(entity_tokens)]))
+    if keywords_text.strip():
+        branches.append(("keywords_only", keywords_text, SPARSE_KEYWORDS_K))
+
+    if question.variants:
+        for i, variant in enumerate(question.variants[:3]):
+            v = variant.strip()
+            if v:
+                v_text = f"{v}\n{keyword_str}" if keyword_str else v
+                branches.append((f"variant_{i}", v_text, SPARSE_VARIANT_K))
+
+    if question.hyde:
+        for i, h in enumerate(question.hyde[:2]):
+            full_hyde = h.strip()[:HYDE_MAX_CHARS]
+            if full_hyde:
+                branches.append((f"hyde_{i}", full_hyde, SPARSE_HYDE_K))
+
+    logger.info("Sparse branches: %s", [(n, len(t), k) for n, t, k in branches])
+    return branches
+
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
@@ -187,65 +249,69 @@ async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
         },
     )
     response.raise_for_status()
-
     payload = DenseEmbeddingResponse.model_validate(response.json())
     if not payload.data:
         raise ValueError("Dense embedding response is empty")
-
     return payload.data[0].embedding
 
 
-async def embed_sparse(text: str) -> SparseVector:
-    vectors = list(get_sparse_model().embed([text]))
-    if not vectors:
-        raise ValueError("Sparse embedding response is empty")
+def _embed_sparse_texts_sync(texts: list[str]) -> list[SparseVector]:
+    model = get_sparse_model()
+    result: list[SparseVector] = []
+    for item in model.embed(texts):
+        result.append(
+            SparseVector(
+                indices=[int(i) for i in item.indices.tolist()],
+                values=[float(v) for v in item.values.tolist()],
+            )
+        )
+    return result
 
-    item = vectors[0]
-    return SparseVector(
-        indices=[int(index) for index in item.indices.tolist()],
-        values=[float(value) for value in item.values.tolist()],
-    )
+
+async def embed_sparse_batch(texts: list[str]) -> list[SparseVector]:
+    return await asyncio.to_thread(_embed_sparse_texts_sync, texts)
 
 
 async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
-    sparse_vector: SparseVector,
-) -> Any | None:
-    response = await client.query_points(
-        collection_name=QDRANT_COLLECTION_NAME,
-        prefetch=[
-            models.Prefetch(
-                query=dense_vector,
-                using=QDRANT_DENSE_VECTOR_NAME,
-                limit=DENSE_PREFETCH_K,
-            ),
+    sparse_branches: list[tuple[str, SparseVector, int]],
+) -> list[Any] | None:
+    prefetches: list[models.Prefetch] = [
+        models.Prefetch(
+            query=dense_vector,
+            using=QDRANT_DENSE_VECTOR_NAME,
+            limit=DENSE_PREFETCH_K,
+        )
+    ]
+    for _name, sparse_vec, limit in sparse_branches:
+        prefetches.append(
             models.Prefetch(
                 query=models.SparseVector(
-                    indices=sparse_vector.indices,
-                    values=sparse_vector.values,
+                    indices=sparse_vec.indices,
+                    values=sparse_vec.values,
                 ),
                 using=QDRANT_SPARSE_VECTOR_NAME,
-                limit=SPRASE_PREFETCH_K,
-            ),
-        ],
+                limit=limit,
+            )
+        )
+
+    logger.info("Qdrant query: %d prefetch branches, retrieve_k=%d", len(prefetches), RETRIEVE_K)
+
+    response = await client.query_points(
+        collection_name=QDRANT_COLLECTION_NAME,
+        prefetch=prefetches,
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
     )
-
-    if not response.points:
-        return None
-
-    return response.points
+    return response.points if response.points else None
 
 
 def extract_message_ids(point: Any) -> list[str]:
     payload = point.payload or {}
     metadata = payload.get("metadata") or {}
-    message_ids = metadata.get("message_ids") or []
-
-    return [str(message_id) for message_id in message_ids]
+    return [str(mid) for mid in (metadata.get("message_ids") or [])]
 
 
 async def get_rerank_scores(
@@ -255,7 +321,6 @@ async def get_rerank_scores(
 ) -> list[float]:
     if not targets:
         return []
-
     # Rerank endpoint возвращает score для пары query -> candidate text.
     response = await client.post(
         RERANKER_URL,
@@ -268,23 +333,24 @@ async def get_rerank_scores(
         },
     )
     response.raise_for_status()
-
-    payload = response.json()
-    data = payload.get("data") or []
-
+    data = response.json().get("data") or []
     return [float(sample["score"]) for sample in data]
 
 
 async def rerank_points(
     client: httpx.AsyncClient,
-    query: str,
+    question: Question,
     points: list[Any],
 ) -> list[Any]:
-    rerank_candidates = points[:10]
-    rerank_targets = [point.payload.get("page_content") for point in rerank_candidates]
-    scores = await get_rerank_scores(client, query, rerank_targets)
+    rerank_candidates = points[:RERANK_LIMIT]
+    tail = points[RERANK_LIMIT:]
 
-    reranked_candidates = [
+    rerank_query = question.text.strip()
+
+    targets = [(point.payload or {}).get("page_content") or "" for point in rerank_candidates]
+    scores = await get_rerank_scores(client, rerank_query, targets)
+
+    reranked = [
         point
         for _, point in sorted(
             zip(scores, rerank_candidates, strict=True),
@@ -293,7 +359,10 @@ async def rerank_points(
         )
     ]
 
-    return reranked_candidates
+    if scores:
+        logger.info("Rerank scores: max=%.4f min=%.4f", max(scores), min(scores))
+
+    return reranked + tail
 
 
 # Ваш сервис должен имплементировать оба этих метода
@@ -304,54 +373,63 @@ async def health() -> dict[str, str]:
 
 @app.post("/search", response_model=SearchAPIResponse)
 async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
-    query = payload.question.text.strip()
-    if not query:
+    question = payload.question
+    if not question.text.strip():
         raise HTTPException(status_code=400, detail="question.text is required")
 
-    client: httpx.AsyncClient = app.state.http
+    http: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    dense_vector = await embed_dense(client, query)
-    sparse_vector = await embed_sparse(query)
-    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector)
+    dense_query = build_dense_query(question)
+    sparse_query_branches = build_sparse_queries(question)
+
+    dense_vector = await embed_dense(http, dense_query)
+
+    sparse_texts = [text for _, text, _ in sparse_query_branches]
+    sparse_vectors = await embed_sparse_batch(sparse_texts)
+
+    sparse_branches = [
+        (name, vec, limit)
+        for (name, _, limit), vec in zip(sparse_query_branches, sparse_vectors)
+    ]
+
+    best_points = await qdrant_search(qdrant, dense_vector, sparse_branches)
 
     if best_points is None:
+        logger.info("No points found for: %r", question.text.strip())
         return SearchAPIResponse(results=[])
 
-    best_points = await rerank_points(client, query, list(best_points))
+    logger.info("Retrieved %d candidate points", len(best_points))
 
-    message_ids: list[str] = [] 
+    best_points = await rerank_points(http, question, list(best_points))
+
+    seen: set[str] = set()
+    message_ids: list[str] = []
     for point in best_points:
-        message_ids += extract_message_ids(point)
+        for mid in extract_message_ids(point):
+            if mid not in seen:
+                seen.add(mid)
+                message_ids.append(mid)
 
-    return SearchAPIResponse(
-        results=[SearchAPIItem(message_ids=message_ids)]
-    )
+    logger.info("Returning %d unique message_ids", len(message_ids))
+
+    return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
 
 
 @app.exception_handler(Exception)
 async def exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception(exc)
     detail = str(exc) or repr(exc)
-
     if isinstance(exc, RequestValidationError):
         return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
     if isinstance(exc, HTTPException):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
     return JSONResponse(status_code=500, content={"detail": detail})
 
 
 def main() -> None:
     import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host=HOST,
-        port=PORT,
-        reload=False,
-    )
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
 
 
 if __name__ == "__main__":
